@@ -10,7 +10,7 @@
 //!   revoke-old-keys --tenant T            delete every key of the bucket but the newest
 //!   retire-tenant --tenant T --confirm T  after the erasure on the proxy: revoke all bucket keys, drain lifecycle
 //!   deprovision-tenant --tenant T --confirm T [--purge]   delete the (drained) bucket
-//!   list                                  state against the account (JSON; key ids shortened to 4 characters)
+//!   list                                  state against the account (JSON; key ids shortened to their last 4 characters)
 //!   check-key --key-env FILE              authorize a key (B2_APPLICATION_KEY_ID/_KEY or a credentials TOML);
 //!                                         print its bucket scope and capabilities
 //! ```
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
             let b2 = admin()?;
             let (e, creds) = provision_tenant(&b2, &state, &tenant, max_buckets)?;
             emit_secret(&args, &creds)?;
-            eprintln!("tenant {tenant}: bucket {} (private, lifecycle D2, object lock off), key {}… {:?}", e.bucket_name, short(&creds.key_id), SCOPED_CAPS);
+            eprintln!("tenant {tenant}: bucket {} (private, lifecycle D2, object lock off), key {} {:?}", e.bucket_name, short(&creds.key_id), SCOPED_CAPS);
             eprintln!("proxy config:\n{}", store_snippet(&b2, &format!("t-{tenant}"), &e.bucket_name, &format!("/etc/s3vault/secrets/store-{tenant}.toml")));
             Ok(())
         }
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
             need(&args, "--out")?;
             let creds = rotate_key(&admin()?, &state, &tenant)?;
             emit_secret(&args, &creds)?;
-            eprintln!("tenant {tenant}: new key {}…; install it on the proxy, restart, then revoke-old-keys", short(&creds.key_id));
+            eprintln!("tenant {tenant}: new key {}; install it on the proxy, restart, then revoke-old-keys", short(&creds.key_id));
             Ok(())
         }
         "revoke-old-keys" => {

@@ -403,3 +403,17 @@ fn sealed_credentials_open_with_the_recipient_key() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8(out.stdout).unwrap(), plain.as_str());
 }
+
+#[test]
+fn random_names_are_uniform_lowercase() {
+    let mut first = std::collections::BTreeSet::new();
+    for _ in 0..2000 {
+        let n = random_name(BUCKET_NAME_LEN);
+        assert_eq!(n.len(), BUCKET_NAME_LEN);
+        assert!(n.as_bytes()[0].is_ascii_lowercase());
+        assert!(n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        first.insert(n.as_bytes()[0]);
+    }
+    assert_eq!(first.len(), 26);
+    assert_eq!(short("0030123456789abc0000000042"), "…0042");
+}

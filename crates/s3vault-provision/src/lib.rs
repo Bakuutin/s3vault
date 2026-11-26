@@ -63,13 +63,15 @@ pub struct Creds {
 
 impl std::fmt::Debug for Creds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Creds({}…)", short(&self.key_id))
+        write!(f, "Creds({})", short(&self.key_id))
     }
 }
 
-/// First 4 characters of a key id: the most any output shows.
+/// Last 4 characters of a key id (B2 key ids of one account share their first characters): the most any
+/// output shows.
 pub fn short(id: &str) -> String {
-    id.chars().take(4).collect()
+    let c: Vec<char> = id.chars().collect();
+    format!("…{}", c[c.len().saturating_sub(4)..].iter().collect::<String>())
 }
 
 /// Parse an env file (`KEY=VALUE`, optional `export `, optional quotes, `#` comments).

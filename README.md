@@ -53,6 +53,7 @@ The store plus the keyring alone rebuild everything (`s3vault rebuild`); the loc
 | Admin API | proxy | `127.0.0.1:9101` (status, fill, verify, reconcile, snapshot, unlock); loopback only, bearer token from `/etc/s3vault/secrets/admin.token` |
 | Source and build tree | proxy | `/opt/s3vault/src` (clone of this repository) |
 | `s3vault-keyd` (container `s3vault-keyd`) | key host | `/srv/s3vault-keyd/` (compose, Dockerfile, `bin/`, `keys/` root 700: `keyring` (master, v2), `tenants` (tenant keyring), `ledger.jsonl` (erasure ledger), `escrow/` (sealed tenant-keyring copies), `psk`; files 600); listens on its private address, port 7373, allows only the proxy's address |
+| `s3vault-provision` | key host | `/srv/s3vault-provision/`: `bin/s3vault-provision`, `b2-admin.env` (the B2 provisioning key, account-admin equivalent; 600), `state.json` (tenant to B2 bucket; 600). Never on the proxy. See [docs/PROVISIONING.md](docs/PROVISIONING.md) |
 | Master keyring backup | owner | `~/.s3vault/master.key` (600) plus a second offline copy in another place. Rarely changes (only on a root change). **Lose every copy and the data is gone.** |
 | Tenant keyring escrow | owner | `~/.s3vault/tenant-escrow/tenants-<time>.sealed` (sealed under the master; a new copy after every tenant change; copies older than 30 days are pruned, the newest is kept) |
 
@@ -67,6 +68,7 @@ hosting provider) can read the keyring: an accepted risk of this design.
 cargo test --workspace                       # integration tests use in-process S3 servers
 cargo build --release -p s3vault             # needs perl + make (vendored OpenSSL for SQLCipher)
 cargo build --release -p s3vault-keyd --target x86_64-unknown-linux-musl   # static, for the scratch image
+cargo build --release -p s3vault-provision   # B2 provisioner for the key host (docs/PROVISIONING.md)
 ```
 
 Needs Rust 1.85 or newer (edition 2024). A release build takes a few minutes; dev builds keep no debug info
@@ -346,30 +348,22 @@ Rollback before `--delete-v1`: the previous binary with the previous config and 
 
 ## Switch the store of record to Backblaze B2
 
-The owner, in the B2 web console or with the `b2` CLI:
+Buckets and keys come from `s3vault-provision` on the key host: **one random-name private bucket per
+tenant** (lifecycle D2, object lock off) and **one key restricted to it** (`listBuckets, listFiles,
+readFiles, writeFiles, deleteFiles`, no `writeKeys`). The account-admin provisioning key stays on the key
+host; the proxy only receives the scoped keys, sealed to its RSA key in transit. Design, flow, rotation,
+erasure and the 100-bucket limit: [docs/PROVISIONING.md](docs/PROVISIONING.md). Before the first bucket:
+choose an **EU region** at account sign-up (fixed per account) and sign Backblaze's DPA (see
+`docs/gdpr/processor-agreements.md`). Never name a bucket after a tenant, a user or the product.
 
-1. Choose an **EU region** at account sign-up (the region is fixed per account) and create a **private**
-   bucket, e.g. `<name>-vault` (no B2 server-side encryption needed: the data is already encrypted; object
-   lock **off**: it would block erasure). Lifecycle (decision D2): **keep only the last version, 7 days from
-   hide to delete**, for the whole bucket:
-   `b2 bucket update --lifecycle-rule '{"daysFromHidingToDeleting": 7, "daysFromUploadingToHiding": null, "fileNamePrefix": ""}' <name>-vault allPrivate`
-   (console: Lifecycle Settings, "Keep only the last version of the file"). The 7 days are both the undelete
-   window and the physical-erasure tail of an erasure. Sign Backblaze's DPA first (see
-   `docs/gdpr/processor-agreements.md`).
-2. Create an **application key restricted to that bucket** with `listBuckets, listFiles, readFiles,
-   writeFiles, deleteFiles` (`b2 key create --bucket <name>-vault s3vault listBuckets,listFiles,readFiles,writeFiles,deleteFiles`).
-   Keep the account master key offline. Note the key id, the key, and the bucket's S3 endpoint
-   (`https://s3.<region>.backblazeb2.com`, region e.g. `eu-central-003`).
+Then on the proxy, per tenant: the credentials file `/etc/s3vault/secrets/store-<tenant>.toml` (from
+`provision-tenant` or `rotate-key`, see docs/PROVISIONING.md section 5), a store `[stores.t-<tenant>]`, and
+the tenant's `[[buckets]]` pointed at it.
 
-Then on the proxy:
-
-```sh
-umask 027; printf 'access_key_id = "%s"\nsecret_access_key = "%s"\n' "$KEY_ID" "$KEY" \
-  > /etc/s3vault/secrets/store-b2.toml; chgrp s3vault /etc/s3vault/secrets/store-b2.toml
-```
-
-Copy the existing ciphertext as-is from the old store (here a local Garage on `127.0.0.1:3910`) (no keyring needed: names and bytes do not depend on the store), e.g. with
-rclone configured through environment variables (fill the keys from the two credentials files; do not echo
+Copy each tenant's existing ciphertext as-is from the old store (here a local Garage on `127.0.0.1:3910`)
+into its own bucket (no keyring needed: names and bytes do not depend on the store). A tenant's objects are
+everything under `o/<tag>/`; the tag is in `sva 127.0.0.1:9101/status` (`tenants[].tag`). For example with
+rclone configured through environment variables (fill the keys from the credentials files; do not echo
 them):
 
 ```sh
@@ -377,14 +371,14 @@ export RCLONE_CONFIG_SRC_TYPE=s3 RCLONE_CONFIG_SRC_PROVIDER=Other RCLONE_CONFIG_
        RCLONE_CONFIG_SRC_REGION=garage RCLONE_CONFIG_SRC_ACCESS_KEY_ID=... RCLONE_CONFIG_SRC_SECRET_ACCESS_KEY=...
 export RCLONE_CONFIG_B2_TYPE=s3 RCLONE_CONFIG_B2_PROVIDER=Other RCLONE_CONFIG_B2_ENDPOINT=https://s3.<region>.backblazeb2.com \
        RCLONE_CONFIG_B2_REGION=<region> RCLONE_CONFIG_B2_ACCESS_KEY_ID=... RCLONE_CONFIG_B2_SECRET_ACCESS_KEY=...
-rclone copy src:s3vault-store/o b2:<name>-vault/o --checksum --transfers 32
+rclone copy src:s3vault-store/o/<tag> b2:<tenant bucket>/o/<tag> --checksum --transfers 32
 ```
 
-Edit `[stores.primary]`: `endpoint = "https://s3.<region>.backblazeb2.com"`, `region = "<region>"`,
-`bucket = "<name>-vault"`, `credentials_file = "/etc/s3vault/secrets/store-b2.toml"`. Stop writes (or accept
-a short window), copy again, `systemctl restart s3vault`, check `/status` and `POST /verify` (with the admin token). The index stays
-valid (it does not depend on the store endpoint). Then the old store can be stopped. Store-side multipart is used above 512 MiB of ciphertext; B2's
-minimum part size (5 MB) is respected.
+Point the tenant's `[[buckets]]` at `t-<tenant>`. Stop writes (or accept a short window), copy again,
+`systemctl restart s3vault`, check `/status` and `POST /verify` (with the admin token). The index stays
+valid (it does not depend on the store endpoint). Tenants can move one at a time; the old store can be
+stopped when none is left on it. Store-side multipart is used above 512 MiB of ciphertext; B2's minimum
+part size (5 MB) is respected.
 
 ## Update a deployment
 
@@ -450,6 +444,7 @@ The first deployment protects the audio store of the application (a personal aud
 | Fallback `d-garage` | `d` | the application's plain Garage, `100.64.0.1:3900`, bucket `media` (about 8.7M objects, 851 GB; a full fill needs the owner's go-ahead) |
 | `s3vault-keyd` | `d` | `/srv/s3vault-keys/` (`keys/`: master keyring v2, tenants, ledger, `escrow/`; `backups/keys-<date>.tar` taken before each key-service change; `bin/s3vault-keyd.prev`), listens `100.64.0.1:7373`, allows `100.64.0.2` only; daily `escrow-prune` from admin's crontab (03:23, log `escrow-prune.log`) |
 | Master keyring backup | owner's Mac | `~/.s3vault-admin/vault-master.v2.key` (master v2, fingerprint `<fingerprint>`, escrowed as `owner-mac`; carries the legacy v1 keys). The v1 file `~/.s3vault-admin/vault-master.key` is now only needed for the v1 legacy keys, which the v2 file also holds. A second offline copy is an owner step |
+| B2 provisioning | `d`, owner's Mac | `d`: `/srv/s3vault-provision/` (provisioning key, state, binary). B2 region `eu-central-003`: tenant `owner` bucket `<bucket-id>`, tenant `system` bucket `<bucket-id>`, one scoped key each; a copy of the scoped keys in `~/.s3vault-admin/b2-s3vault.env` on the Mac. Not used by the proxy yet (ST1) |
 | Tenant keyring escrow | owner's Mac | `~/.s3vault-admin/tenant-escrow/tenants-<issued>.sealed` (prune with `s3vault escrow-prune --dir ~/.s3vault-admin/tenant-escrow --max-age-days 30`; scheduling it on the Mac is an owner step) |
 
 Tenants: `owner` (bucket `media`, fallback `d-garage`/`media`), `scratch` (bucket `scratch`); `drill` was
