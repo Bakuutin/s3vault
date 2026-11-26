@@ -192,7 +192,11 @@ key authorizes with exactly its own bucket and `SCOPED_CAPS` (no `writeKeys`); S
 LIST and DELETE (by version id, nothing left) in its own bucket; PUT, GET and LIST on the other tenant's
 bucket answer 403. `list` shows both buckets private, lifecycle D2, object lock off.
 
-The proxy still uses the Garage stand-in; switching it to B2 (ST1) is a separate step.
+**ST1 step 1, 2026-11-26:** `w`'s recipient key made (`/etc/s3vault/secrets/provision-recipient.key`), a second
+`owner` key (…0006) minted with `rotate-key --recipient` and opened straight into `store-owner.toml` on `w`;
+`[stores.t-owner]` serves `media` and `pbm`; the owner's 1,206 objects copied as-is from the stand-in (`deploy/tools/
+s3sum.py --pull-to`, then `--push-from --skip-existing`, which retried a B2 500), SHA-256 identical. Old key …0004
+(the Mac's copy) still valid: `revoke-old-keys` is the owner's call. `scratch` stays on the stand-in.
 
 What the ST1 switch needs next (in order): Backblaze's DPA signed (D5); bounded retries with jitter on B2
 500/503 (review M4) before any load; the proxy's recipient key (section 5), and the `owner` key installed on
