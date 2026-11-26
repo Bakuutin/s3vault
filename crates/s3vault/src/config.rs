@@ -27,9 +27,13 @@ pub struct Config {
 pub struct ServerCfg {
     /// S3 listeners. Bind only private addresses (loopback, Tailscale); the proxy has no rate limiting.
     pub listen: Vec<String>,
-    /// Admin HTTP listener (status, fill, verify, snapshot). Keep it on loopback.
+    /// Admin HTTP listener (status, fill, verify, snapshot). Must be a loopback address.
     #[serde(default)]
     pub admin_listen: Option<String>,
+    /// File with the admin bearer token (one line, mode 640). Required with `admin_listen`: every admin
+    /// call must send `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub admin_token_file: Option<PathBuf>,
     pub data_dir: PathBuf,
     #[serde(default = "default_region")]
     pub region: String,
@@ -142,6 +146,9 @@ pub struct FallbackRef {
     /// Key into `[fallbacks]`.
     pub source: String,
     pub bucket: String,
+    /// The fallback is retired (emptied or switched off): fill and reconcile refuse to run against it.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -170,6 +177,16 @@ pub struct FillCfg {
     /// While a live read-through fetch is running, the fill pauses in steps of this many milliseconds.
     #[serde(default = "default_fill_yield")]
     pub yield_ms: u64,
+    /// Reconcile refuses to remove more than this fraction of the checked filled rows unless forced.
+    #[serde(default = "default_reconcile_max_fraction")]
+    pub reconcile_max_fraction: f64,
+}
+
+/// Upper bound for the fill concurrency an admin call may ask for.
+pub const MAX_FILL_CONCURRENCY: usize = 32;
+
+fn default_reconcile_max_fraction() -> f64 {
+    0.01
 }
 
 impl Default for FillCfg {
@@ -178,6 +195,7 @@ impl Default for FillCfg {
             concurrency: default_fill_conc(),
             rate_bytes_per_sec: default_fill_rate(),
             yield_ms: default_fill_yield(),
+            reconcile_max_fraction: default_reconcile_max_fraction(),
         }
     }
 }
@@ -269,6 +287,20 @@ impl Config {
                     bail!("client {}: unknown bucket {b}", c.name);
                 }
             }
+        }
+        if let Some(a) = &self.server.admin_listen {
+            let sa: std::net::SocketAddr = a
+                .parse()
+                .with_context(|| format!("admin_listen {a}"))?;
+            if !sa.ip().is_loopback() {
+                bail!("admin_listen {a} must be a loopback address");
+            }
+            if self.server.admin_token_file.is_none() {
+                bail!("admin_listen needs admin_token_file (s3vault gen-admin-token --out FILE)");
+            }
+        }
+        if !(0.0..=1.0).contains(&self.fill.reconcile_max_fraction) {
+            bail!("fill.reconcile_max_fraction must be within 0..1");
         }
         match self.keys.source {
             KeySource::Keyd => {

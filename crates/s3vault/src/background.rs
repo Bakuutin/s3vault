@@ -2,8 +2,8 @@
 //! multipart expiry, and the offline rebuild of the index from the store plus the keyring.
 
 use crate::config::{KeySource, KeysCfg, META_BUCKET};
-use crate::index::{FillRow, Index, LIVE, ObjRow, TOMBSTONE};
-use crate::remote::{ListItem, Remote};
+use crate::index::{FillRow, Index, LIVE, ObjRow, ScratchSet, TOMBSTONE};
+use crate::remote::{ListItem, Remote, StoreView};
 use crate::spool::spool_stream;
 use crate::vault::{FillOutcome, ObjInfo, Vault, VaultError, now_ms};
 use anyhow::{Context, Result, anyhow, bail};
@@ -226,6 +226,9 @@ impl Fills {
         let b = vault.bucket(bucket).map_err(|e| e.to_string())?;
         if b.fallback.is_none() {
             return Err(format!("bucket {bucket} has no fallback"));
+        }
+        if b.fallback_retired {
+            return Err(format!("the fallback of {bucket} is marked retired"));
         }
         let mut map = self.map.lock().unwrap();
         if let Some(h) = map.get(bucket)
@@ -547,25 +550,63 @@ pub struct ReconcileReport {
     pub checked: u64,
     pub gone_in_fallback: u64,
     pub changed_in_fallback: u64,
+    /// Rows found stale (gone or changed). A real run must be called with `expect` equal to this.
+    pub stale: u64,
     pub removed: u64,
     pub dry_run: bool,
+    /// Refusal threshold: the run is refused when `stale / checked` exceeds it, unless forced.
+    pub max_fraction: f64,
     pub elapsed_ms: u64,
     pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReconcileOpts {
+    pub dry_run: bool,
+    /// The stale count reported by the dry run (required for a real run).
+    pub expect: Option<u64>,
+    /// Allow removing more than `fill.reconcile_max_fraction` of the checked rows.
+    pub force: bool,
 }
 
 /// Drop filled copies that went stale because the fallback changed after the fill (key deleted there, or
 /// overwritten with another ETag). Only rows that came from the fallback (`origin` = 1) are considered; client
 /// writes and tombstones are never touched. A removed row makes the next read or fill fetch the current
 /// fallback object again (or 404 if it is gone). Walks the index and the fallback listing in key order.
-pub async fn reconcile(vault: Arc<Vault>, bucket: &str, dry_run: bool) -> Result<ReconcileReport> {
+///
+/// Guards (review H3): refused when the fallback is marked retired or its listing is empty; a key counts as
+/// gone only when a direct HEAD answers 404 (any other error aborts the run: an unreachable fallback is
+/// never read as "deleted"); a real run needs `expect` equal to a dry run's `stale`, and is refused above
+/// `fill.reconcile_max_fraction` of the checked rows unless `force` is set.
+pub async fn reconcile(
+    vault: Arc<Vault>,
+    bucket: &str,
+    opts: ReconcileOpts,
+) -> Result<ReconcileReport> {
     let u = vault.unlocked()?;
     let b = vault.bucket(bucket)?;
     let fb = b.fallback.clone().context("bucket has no fallback")?;
+    if b.fallback_retired {
+        bail!("the fallback of {bucket} is marked retired: reconcile refused");
+    }
     let t0 = Instant::now();
+    let max_fraction = vault.cfg.fill.reconcile_max_fraction;
     let mut rep = ReconcileReport {
-        dry_run,
+        dry_run: opts.dry_run,
+        max_fraction,
         ..Default::default()
     };
+    // Positive evidence that the fallback is the populated source it should be.
+    let first = fb
+        .list("", None, None, 1)
+        .await
+        .map_err(|e| anyhow!("fallback list: {e}"))?;
+    if first.items.is_empty() {
+        bail!(
+            "the fallback of {bucket} lists no objects (retired, emptied or the wrong bucket): reconcile refused"
+        );
+    }
+    let mut stale_rows: Vec<ObjRow> = Vec::new();
     let mut after = String::new();
     let mut fb_buf: std::collections::VecDeque<ListItem> = Default::default();
     let mut fb_after = String::new();
@@ -580,26 +621,20 @@ pub async fn reconcile(vault: Arc<Vault>, bucket: &str, dry_run: bool) -> Result
         {
             rep.checked += 1;
             let mut pages = 0;
-            let fallback_etag: Option<String> = loop {
+            let listed: Option<String> = loop {
                 while fb_buf.front().is_some_and(|i| i.key < r.key) {
                     fb_buf.pop_front();
                 }
                 if let Some(f) = fb_buf.front() {
                     break (f.key == r.key).then(|| f.etag.clone());
                 }
-                if fb_done {
+                if fb_done || pages >= 3 {
+                    // End of the listing or a long gap: the direct HEAD below decides.
+                    if pages >= 3 {
+                        fb_after = r.key.clone();
+                        fb_done = false;
+                    }
                     break None;
-                }
-                if pages >= 3 {
-                    // A long gap in the listing: ask for this key directly and jump past it.
-                    let e = match fb.head(&r.key).await {
-                        Ok(m) => Some(m.etag),
-                        Err(crate::remote::RemoteError::NotFound) => None,
-                        Err(e) => bail!("fallback: {e}"),
-                    };
-                    fb_after = r.key.clone();
-                    fb_done = false;
-                    break e;
                 }
                 let sa = if fb_after.is_empty() {
                     None
@@ -620,14 +655,15 @@ pub async fn reconcile(vault: Arc<Vault>, bucket: &str, dry_run: bool) -> Result
                 }
                 fb_buf.extend(page.items);
             };
-            // Some servers omit ETags in listings: ask for it.
-            let fallback_etag = match fallback_etag {
-                Some(e) if e.is_empty() => match fb.head(&r.key).await {
+            // Absent from the listing, or listed without an ETag: ask for the key itself. Only a 404 is
+            // evidence of a delete; any other answer aborts.
+            let fallback_etag = match listed {
+                Some(e) if !e.is_empty() => Some(e),
+                _ => match fb.head(&r.key).await {
                     Ok(m) => Some(m.etag),
                     Err(crate::remote::RemoteError::NotFound) => None,
-                    Err(e) => bail!("fallback: {e}"),
+                    Err(e) => bail!("fallback HEAD failed, reconcile aborted: {e}"),
                 },
-                other => other,
             };
             let stale = match &fallback_etag {
                 None => {
@@ -646,14 +682,41 @@ pub async fn reconcile(vault: Arc<Vault>, bucket: &str, dry_run: bool) -> Result
             if rep.examples.len() < 20 {
                 rep.examples.push(r.key.clone());
             }
-            if !dry_run && vault.remove_if_unchanged(&u, &b, &r).await? {
-                rep.removed += 1;
-            }
+            stale_rows.push(r);
         }
         after = next_after;
     }
+    rep.stale = stale_rows.len() as u64;
+    if !opts.dry_run {
+        if opts.expect != Some(rep.stale) {
+            bail!(
+                "the dry run's count (expect={:?}) does not match the {} stale rows found now: run dry_run=1 again",
+                opts.expect,
+                rep.stale
+            );
+        }
+        let fraction = if rep.checked == 0 {
+            0.0
+        } else {
+            rep.stale as f64 / rep.checked as f64
+        };
+        if fraction > max_fraction && !opts.force {
+            bail!(
+                "reconcile would remove {} of {} filled rows ({:.2}%), above the {:.2}% cap: check the fallback, then pass force=1",
+                rep.stale,
+                rep.checked,
+                fraction * 100.0,
+                max_fraction * 100.0
+            );
+        }
+        for r in &stale_rows {
+            if vault.remove_if_unchanged(&u, &b, r).await? {
+                rep.removed += 1;
+            }
+        }
+    }
     rep.elapsed_ms = t0.elapsed().as_millis() as u64;
-    info!(bucket, ?rep, "reconcile done");
+    info!(bucket, checked = rep.checked, stale = rep.stale, removed = rep.removed, dry_run = rep.dry_run, "reconcile done");
     Ok(rep)
 }
 
@@ -775,11 +838,11 @@ pub struct RebuildReport {
 }
 
 async fn read_header(
-    store: &Remote,
+    store: &dyn StoreView,
     kr: &Keyring,
     name: &str,
 ) -> Result<(object::Header, object::SealInfo)> {
-    let (_, b) = store
+    let b = store
         .get_bytes(name, Some((0, HEAD_PROBE_LEN as u64 - 1)))
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -789,7 +852,6 @@ async fn read_header(
             .get_bytes(name, Some((0, need as u64 - 1)))
             .await
             .map_err(|e| anyhow!("{e}"))?
-            .1
     } else {
         b
     };
@@ -816,42 +878,130 @@ fn row_from_header(h: &object::Header, s: &object::SealInfo) -> ObjRow {
     }
 }
 
-/// Load the latest index snapshot from the meta store into `index`. Returns (rows, snapshot time).
-async fn load_snapshot(vault: &Vault, kr: &Keyring, index: &Index) -> Result<Option<(u64, i64)>> {
-    let store = vault.stores[vault.cfg.meta_store()].clone();
+/// Rows per transaction when loading a snapshot or applying rebuilt rows.
+const LOAD_BATCH: usize = 5000;
+
+/// Read an object's head (preamble and sealed header) from the start of a ciphertext stream. Returns the
+/// opened header, its seal info and the rest of the stream (the body ciphertext).
+async fn open_stream_head(
+    kr: &Keyring,
+    mut ct: crate::remote::ByteStream,
+) -> Result<(object::Header, object::SealInfo, crate::remote::ByteStream)> {
+    let mut buf = bytes::BytesMut::new();
+    let mut need = object::PREAMBLE_LEN;
+    let mut have_len = false;
+    loop {
+        if buf.len() >= need {
+            if have_len {
+                break;
+            }
+            need = object::needed_head_len(&buf)?;
+            have_len = true;
+            continue;
+        }
+        match ct.next().await {
+            Some(c) => buf.extend_from_slice(&c?),
+            None => bail!("object shorter than its header"),
+        }
+    }
+    let rest = buf.split_off(need).freeze();
+    let (h, seal) = object::open_head(kr, &buf)?;
+    let body: crate::remote::ByteStream =
+        Box::pin(futures::stream::once(async move { Ok(rest) }).chain(ct));
+    Ok((h, seal, body))
+}
+
+/// Stream the latest index snapshot from the meta store into `index`, in transactions of [`LOAD_BATCH`]
+/// rows, without holding the snapshot in RAM (review H4). Each row's store name goes into the scratch
+/// `known` set. Returns (rows, snapshot time).
+async fn load_snapshot(
+    vault: &Vault,
+    meta: &dyn StoreView,
+    meta_prefix: &str,
+    kr: &Keyring,
+    index: &Index,
+) -> Result<Option<(u64, i64)>> {
+    let name_key = kr.name_key();
     let name = format!(
-        "{}{}",
-        store.prefix,
-        object::store_name(&kr.name_key(), META_BUCKET, SNAPSHOT_KEY)
+        "{meta_prefix}{}",
+        object::store_name(&name_key, META_BUCKET, SNAPSHOT_KEY)
     );
-    let (_, ct) = match store.get_bytes(&name, None).await {
-        Ok(v) => v,
+    let ct = match meta.get_stream(&name, None).await {
+        Ok((_, s)) => s,
         Err(crate::remote::RemoteError::NotFound) => return Ok(None),
         Err(e) => bail!("snapshot: {e}"),
     };
-    let (h, seal) = object::open_head(kr, &ct)?;
+    let (h, seal, body_ct) = open_stream_head(kr, ct).await?;
     let layout = Layout {
         header_sealed_len: seal.header_sealed_len as u64,
         size: h.size,
     };
     let cipher = object::body_cipher(kr, &seal)?;
-    let last = layout.n_chunks() - 1;
-    let (s, e) = layout.ciphertext_span(0, last);
-    let body = object::open_range(
-        &cipher,
-        &layout,
-        0,
-        last,
-        &ct[s as usize..=e as usize],
-        0,
-        h.size,
-    )?;
-    let mut n = 0;
-    for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let r: ObjRow = serde_json::from_slice(line)?;
-        index.upsert_if_newer(&r)?;
-        n += 1;
+    let mut plain = if h.size == 0 {
+        Box::pin(futures::stream::empty()) as crate::remote::ByteStream
+    } else {
+        crate::streams::decrypt_stream(
+            body_ct,
+            cipher,
+            layout,
+            0,
+            layout.n_chunks() - 1,
+            0,
+            h.size,
+        )
+    };
+    let mut n = 0u64;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut batch: Vec<ObjRow> = Vec::with_capacity(LOAD_BATCH);
+    let flush = |batch: &mut Vec<ObjRow>| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = batch
+            .iter()
+            .filter_map(|r| {
+                vault.buckets.get(&r.bucket).map(|b| {
+                    format!(
+                        "{}{}",
+                        b.store.prefix,
+                        object::store_name(&name_key, &r.bucket, &r.key)
+                    )
+                })
+            })
+            .collect();
+        index.upsert_many_if_newer(batch)?;
+        index.scratch_add(ScratchSet::Known, &names)?;
+        batch.clear();
+        Ok(())
+    };
+    loop {
+        let chunk = plain.next().await;
+        let eof = chunk.is_none();
+        if let Some(c) = chunk {
+            pending.extend_from_slice(&c.context("snapshot body")?);
+        }
+        let mut start = 0;
+        while let Some(pos) = pending[start..].iter().position(|b| *b == b'\n') {
+            let line = &pending[start..start + pos];
+            start += pos + 1;
+            if line.is_empty() {
+                continue;
+            }
+            batch.push(serde_json::from_slice(line).context("snapshot row")?);
+            n += 1;
+            if batch.len() >= LOAD_BATCH {
+                flush(&mut batch)?;
+            }
+        }
+        pending.drain(..start);
+        if eof {
+            break;
+        }
     }
+    if !pending.iter().all(|b| b.is_ascii_whitespace()) {
+        bail!("snapshot ends with a partial row");
+    }
+    flush(&mut batch)?;
     Ok(Some((n, h.mtime_ms)))
 }
 
@@ -865,125 +1015,178 @@ pub async fn rebuild(
     use_snapshot: bool,
     concurrency: usize,
 ) -> Result<RebuildReport> {
+    rebuild_with(vault, kr, index, use_snapshot, concurrency, &|r| {
+        r.clone() as Arc<dyn StoreView>
+    })
+    .await
+}
+
+/// [`rebuild`] over arbitrary store views (`view` maps each configured store to the view to read).
+///
+/// Memory stays bounded at any index size (review H4): the snapshot is streamed and applied in
+/// transactions, and the two name sets (snapshot rows, listed names) live in a scratch sqlite file next
+/// to the index instead of in hash maps.
+pub async fn rebuild_with(
+    vault: Arc<Vault>,
+    kr: &Keyring,
+    index: &Index,
+    use_snapshot: bool,
+    concurrency: usize,
+    view: &(dyn Fn(&Arc<Remote>) -> Arc<dyn StoreView> + Sync),
+) -> Result<RebuildReport> {
     let t0 = Instant::now();
     let mut rep = RebuildReport::default();
     let name_key = kr.name_key();
-    let mut snapshot_ms = None;
-    // store name -> (bucket, key) for rows that came from the snapshot
-    let mut known: HashMap<String, (String, String)> = HashMap::new();
-    if use_snapshot {
-        if let Some((n, t)) = load_snapshot(&vault, kr, index).await? {
-            rep.snapshot_rows = n;
-            snapshot_ms = Some(t);
-            let (mut ab, mut ak) = (String::new(), String::new());
-            loop {
-                let page = index.page_rows(&ab, &ak, 5000)?;
-                let Some(last) = page.last() else { break };
-                (ab, ak) = (last.bucket.clone(), last.key.clone());
-                for r in &page {
-                    if let Some(b) = vault.buckets.get(&r.bucket) {
-                        let name = format!(
-                            "{}{}",
-                            b.store.prefix,
-                            object::store_name(&name_key, &r.bucket, &r.key)
-                        );
-                        known.insert(name, (r.bucket.clone(), r.key.clone()));
-                    }
-                }
+    let scratch = vault
+        .cfg
+        .server
+        .data_dir
+        .join(format!("rebuild-scratch-{}.db", std::process::id()));
+    index.scratch_attach(&scratch)?;
+    let res = async {
+        let mut snapshot_ms = None;
+        if use_snapshot {
+            let meta_remote = vault.stores[vault.cfg.meta_store()].clone();
+            let meta = view(&meta_remote);
+            if let Some((n, t)) =
+                load_snapshot(&vault, &*meta, &meta_remote.prefix, kr, index).await?
+            {
+                rep.snapshot_rows = n;
+                snapshot_ms = Some(t);
+                info!(rows = n, "snapshot loaded; reading headers written since");
+            } else {
+                info!("no snapshot found; full header scan");
             }
-            info!(rows = n, "snapshot loaded; reading headers written since");
-        } else {
-            info!("no snapshot found; full header scan");
         }
-    }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut done_stores = HashSet::new();
-    for b in vault.buckets.values() {
-        if !done_stores.insert(b.store.label.clone()) {
-            continue;
-        }
-        let store = b.store.clone();
-        let mut token: Option<String> = None;
-        loop {
-            let page = store
-                .list(&store.prefix, None, token.as_deref(), 1000)
-                .await
-                .map_err(|e| anyhow!("list: {e}"))?;
-            rep.listed += page.items.len() as u64;
-            let todo: Vec<ListItem> = page
-                .items
-                .into_iter()
-                .filter(|it| {
-                    seen.insert(it.key.clone());
-                    match snapshot_ms {
+        let mut done_stores = HashSet::new();
+        for b in vault.buckets.values() {
+            if !done_stores.insert(b.store.label.clone()) {
+                continue;
+            }
+            let store = view(&b.store);
+            let prefix = b.store.prefix.clone();
+            let mut token: Option<String> = None;
+            loop {
+                let page = store
+                    .list_page(&prefix, token.as_deref(), 1000)
+                    .await
+                    .map_err(|e| anyhow!("list: {e}"))?;
+                rep.listed += page.items.len() as u64;
+                let names: Vec<String> = page.items.iter().map(|i| i.key.clone()).collect();
+                index.scratch_add(ScratchSet::Seen, &names)?;
+                let known = match snapshot_ms {
+                    None => vec![false; names.len()],
+                    Some(_) => index.scratch_contains(ScratchSet::Known, &names)?,
+                };
+                let todo: Vec<ListItem> = page
+                    .items
+                    .into_iter()
+                    .zip(known)
+                    .filter(|(it, known)| match snapshot_ms {
                         None => true,
                         Some(t) => {
-                            !known.contains_key(&it.key)
-                                || it.last_modified_ms.is_none_or(|lm| lm >= t - 3_600_000)
+                            !known || it.last_modified_ms.is_none_or(|lm| lm >= t - 3_600_000)
                         }
-                    }
-                })
-                .collect();
-            let results: Vec<Result<Option<ObjRow>>> = futures::stream::iter(todo)
-                .map(|it| {
-                    let store = store.clone();
-                    let name_key = &name_key;
-                    async move {
-                        let (h, s) = read_header(&store, kr, &it.key).await.with_context(|| it.key.clone())?;
-                        if h.bucket == META_BUCKET {
-                            return Ok(None);
+                    })
+                    .map(|(it, _)| it)
+                    .collect();
+                let results: Vec<Result<Option<ObjRow>>> = futures::stream::iter(todo)
+                    .map(|it| {
+                        let store = store.clone();
+                        let name_key = &name_key;
+                        let prefix = &prefix;
+                        async move {
+                            let (h, s) = read_header(&*store, kr, &it.key)
+                                .await
+                                .with_context(|| it.key.clone())?;
+                            if h.bucket == META_BUCKET {
+                                return Ok(None);
+                            }
+                            let expect =
+                                format!("{prefix}{}", object::store_name(name_key, &h.bucket, &h.key));
+                            if expect != it.key {
+                                warn!(name = %it.key, "object header does not match its name (misplaced or foreign)");
+                                return Err(anyhow!("misplaced object {}", it.key));
+                            }
+                            Ok(Some(row_from_header(&h, &s)))
                         }
-                        let expect = format!("{}{}", store.prefix, object::store_name(name_key, &h.bucket, &h.key));
-                        if expect != it.key {
-                            warn!(name = %it.key, "object header does not match its name (misplaced or foreign)");
-                            return Err(anyhow!("misplaced object {}", it.key));
+                    })
+                    .buffer_unordered(concurrency.max(1))
+                    .collect()
+                    .await;
+                let mut rows = Vec::new();
+                for r in results {
+                    match r {
+                        Ok(Some(row)) => {
+                            rep.headers_read += 1;
+                            if row.state == LIVE {
+                                rep.live += 1;
+                            } else {
+                                rep.tombstones += 1;
+                            }
+                            rows.push(row);
                         }
-                        Ok(Some(row_from_header(&h, &s)))
-                    }
-                })
-                .buffer_unordered(concurrency.max(1))
-                .collect()
-                .await;
-            for r in results {
-                match r {
-                    Ok(Some(row)) => {
-                        rep.headers_read += 1;
-                        if row.state == LIVE {
-                            rep.live += 1;
-                        } else {
-                            rep.tombstones += 1;
+                        Ok(None) => rep.headers_read += 1,
+                        Err(e) => {
+                            rep.errors += 1;
+                            if e.to_string().contains("misplaced") {
+                                rep.foreign_or_bad += 1;
+                            }
+                            warn!("rebuild: {e:#}");
                         }
-                        index.upsert_if_newer(&row)?;
-                    }
-                    Ok(None) => rep.headers_read += 1,
-                    Err(e) => {
-                        rep.errors += 1;
-                        if e.to_string().contains("misplaced") {
-                            rep.foreign_or_bad += 1;
-                        }
-                        warn!("rebuild: {e:#}");
                     }
                 }
-            }
-            if rep.listed % 100_000 < 1000 {
-                info!(
-                    listed = rep.listed,
-                    headers = rep.headers_read,
-                    "rebuild progress"
-                );
-            }
-            token = page.next_token;
-            if token.is_none() {
-                break;
+                index.upsert_many_if_newer(&rows)?;
+                if rep.listed % 100_000 < 1000 {
+                    info!(
+                        listed = rep.listed,
+                        headers = rep.headers_read,
+                        "rebuild progress"
+                    );
+                }
+                token = page.next_token;
+                if token.is_none() {
+                    break;
+                }
             }
         }
-    }
-    for (name, (bucket, key)) in &known {
-        if !seen.contains(name) {
-            index.remove(bucket, key)?;
-            rep.removed_stale += 1;
+        // Rows from the snapshot whose object is no longer in the store: remove (streamed).
+        if snapshot_ms.is_some() {
+            let (mut ab, mut ak) = (String::new(), String::new());
+            loop {
+                let page = index.page_rows(&ab, &ak, LOAD_BATCH)?;
+                let Some(last) = page.last() else { break };
+                (ab, ak) = (last.bucket.clone(), last.key.clone());
+                let cand: Vec<&ObjRow> = page
+                    .iter()
+                    .filter(|r| vault.buckets.contains_key(&r.bucket))
+                    .collect();
+                let names: Vec<String> = cand
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}{}",
+                            vault.buckets[&r.bucket].store.prefix,
+                            object::store_name(&name_key, &r.bucket, &r.key)
+                        )
+                    })
+                    .collect();
+                let seen = index.scratch_contains(ScratchSet::Seen, &names)?;
+                let gone: Vec<(String, String)> = cand
+                    .iter()
+                    .zip(seen)
+                    .filter(|(_, s)| !s)
+                    .map(|(r, _)| (r.bucket.clone(), r.key.clone()))
+                    .collect();
+                rep.removed_stale += gone.len() as u64;
+                index.remove_many(&gone)?;
+            }
         }
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
+    index.scratch_detach(&scratch)?;
+    res?;
     rep.elapsed_ms = t0.elapsed().as_millis() as u64;
     Ok(rep)
 }

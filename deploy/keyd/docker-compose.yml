@@ -38,6 +38,20 @@ services:
     network_mode: none
     volumes:
       - ./keys:/keys
+  escrow-export:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    command: ["escrow-export", "--dir", "/keys"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys:ro
+  escrow-confirm:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    entrypoint: ["/s3vault-keyd", "escrow-confirm", "--dir", "/keys"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys
   fingerprint:
     profiles: ["admin"]
     image: s3vault-keyd:local

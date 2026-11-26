@@ -25,12 +25,42 @@ pub struct ObjRow {
     pub meta: String,
     pub generation: u64,
     pub kid: u32,
+    #[serde(with = "hex32")]
     pub salt: [u8; 32],
     pub hlen: u32,
+    #[serde(with = "hex32")]
     pub ad: [u8; 32],
     pub mtime_ms: i64,
     /// 0 = client write, 1 = filled from a fallback, 2 = rebuilt from the store.
     pub origin: i64,
+}
+
+/// 32-byte fields as hex in snapshots (about half the size of a JSON number array). Reading also accepts
+/// the number arrays written by earlier versions.
+mod hex32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(v))
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Hex(String),
+        Arr([u8; 32]),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        match Either::deserialize(d)? {
+            Either::Arr(a) => Ok(a),
+            Either::Hex(h) => {
+                let mut out = [0u8; 32];
+                hex::decode_to_slice(&h, &mut out).map_err(serde::de::Error::custom)?;
+                Ok(out)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +90,21 @@ pub struct FillRow {
     pub skipped: u64,
     pub errors: u64,
     pub finished: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ScratchSet {
+    Known,
+    Seen,
+}
+
+impl ScratchSet {
+    fn table(self) -> &'static str {
+        match self {
+            ScratchSet::Known => "known",
+            ScratchSet::Seen => "seen",
+        }
+    }
 }
 
 pub struct Index {
@@ -195,6 +240,121 @@ impl Index {
         }
         self.upsert(r)?;
         Ok(true)
+    }
+
+    /// Insert each row unless an equal or newer generation exists, in one transaction. Returns how many
+    /// rows were written. Used by the streamed snapshot load and the rebuild.
+    pub fn upsert_many_if_newer(&self, rows: &[ObjRow]) -> Result<u64> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut n = 0;
+        {
+            let mut get =
+                tx.prepare_cached("SELECT generation FROM objects WHERE bucket = ?1 AND key = ?2")?;
+            let mut put = tx.prepare_cached(&format!(
+                "INSERT OR REPLACE INTO objects ({COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
+            ))?;
+            for r in rows {
+                let old: Option<i64> = get
+                    .query_row(params![r.bucket, r.key], |x| x.get(0))
+                    .optional()?;
+                if old.is_some_and(|g| g as u64 >= r.generation) {
+                    continue;
+                }
+                put.execute(params![
+                    r.bucket,
+                    r.key,
+                    r.state,
+                    r.size as i64,
+                    r.etag,
+                    r.sha256,
+                    r.content_type,
+                    r.meta,
+                    r.generation as i64,
+                    r.kid as i64,
+                    &r.salt[..],
+                    r.hlen as i64,
+                    &r.ad[..],
+                    r.mtime_ms,
+                    r.origin
+                ])?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        self.changes.fetch_add(1, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    /// Remove many rows in one transaction.
+    pub fn remove_many(&self, keys: &[(String, String)]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare_cached("DELETE FROM objects WHERE bucket = ?1 AND key = ?2")?;
+            for (b, k) in keys {
+                st.execute(params![b, k])?;
+            }
+        }
+        tx.commit()?;
+        self.changes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    // ---- rebuild scratch sets (on disk, so a rebuild of millions of rows runs in bounded RAM) ----
+
+    /// Attach a scratch database holding two name sets: `known` (store names of snapshot rows) and
+    /// `seen` (store names listed in the store). Names are keyed hashes: they reveal nothing. With
+    /// SQLCipher the attached file uses the index key.
+    pub fn scratch_attach(&self, path: &Path) -> Result<()> {
+        let _ = std::fs::remove_file(path);
+        let c = self.c();
+        c.execute(
+            "ATTACH DATABASE ?1 AS rb",
+            params![path.to_string_lossy()],
+        )?;
+        c.execute_batch(
+            "PRAGMA rb.journal_mode = OFF; PRAGMA rb.synchronous = OFF;
+             CREATE TABLE rb.known (name TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE rb.seen (name TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+        Ok(())
+    }
+
+    pub fn scratch_detach(&self, path: &Path) -> Result<()> {
+        self.c().execute_batch("DETACH DATABASE rb")?;
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Add names to a scratch set (`known` or `seen`).
+    pub fn scratch_add(&self, set: ScratchSet, names: &[String]) -> Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        {
+            let mut st = tx.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO rb.{} (name) VALUES (?1)",
+                set.table()
+            ))?;
+            for n in names {
+                st.execute(params![n])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Membership of each name in a scratch set.
+    pub fn scratch_contains(&self, set: ScratchSet, names: &[String]) -> Result<Vec<bool>> {
+        let c = self.c();
+        let mut st = c.prepare_cached(&format!(
+            "SELECT 1 FROM rb.{} WHERE name = ?1",
+            set.table()
+        ))?;
+        names
+            .iter()
+            .map(|n| Ok(st.exists(params![n])?))
+            .collect()
     }
 
     pub fn remove(&self, bucket: &str, key: &str) -> Result<()> {
@@ -442,6 +602,20 @@ mod tests {
             mtime_ms: 0,
             origin: 0,
         }
+    }
+
+    #[test]
+    fn snapshot_row_json_is_hex_and_reads_old_arrays() {
+        let r = row("k", LIVE);
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(&hex::encode([1u8; 32])), "{j}");
+        assert_eq!(serde_json::from_str::<ObjRow>(&j).unwrap(), r);
+        // the earlier format (number arrays)
+        let old = j
+            .replace(&format!("\"{}\"", hex::encode([1u8; 32])), &format!("{:?}", [1u8; 32]))
+            .replace(&format!("\"{}\"", hex::encode([2u8; 32])), &format!("{:?}", [2u8; 32]));
+        assert!(old.contains("[1, 1"));
+        assert_eq!(serde_json::from_str::<ObjRow>(&old).unwrap(), r);
     }
 
     #[test]

@@ -44,6 +44,7 @@ md-5.workspace = true
 hex.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+subtle.workspace = true
 data-encoding.workspace = true
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }

@@ -37,7 +37,7 @@ The store plus the keyring alone rebuild everything (`s3vault rebuild`); the loc
 |---|---|---|
 | `s3vault` (systemd `s3vault.service`) | proxy | `/usr/local/bin/s3vault`, `/etc/s3vault/config.toml`, `/etc/s3vault/secrets/*` (root:s3vault 640), `/var/lib/s3vault/` (index.db SQLCipher, spool, staging) |
 | S3 listeners | proxy | `127.0.0.1:9100` and a private (e.g. Tailscale) address, port 9100. Never a public IP; firewall the rest |
-| Admin API | proxy | `127.0.0.1:9101` (status, fill, verify, reconcile, snapshot, unlock) |
+| Admin API | proxy | `127.0.0.1:9101` (status, fill, verify, reconcile, snapshot, unlock); loopback only, bearer token from `/etc/s3vault/secrets/admin.token` |
 | Source and build tree | proxy | `/opt/s3vault/src` (clone of this repository) |
 | `s3vault-keyd` (container `s3vault-keyd`) | key host | `/srv/s3vault-keyd/` (compose, Dockerfile, `bin/`, `keys/` root 700 with `keyring` and `psk`, 600); listens on its private address, port 7373, allows only the proxy's address |
 | Keyring backup | owner | `~/.s3vault/master.key` (600). Keep a second offline copy. **Lose every copy and the data is gone.** |
@@ -50,7 +50,7 @@ hosting provider) can read the keyring: an accepted risk of this design.
 ## Build
 
 ```sh
-cargo test --workspace                       # 19 tests; integration tests use in-process S3 servers
+cargo test --workspace                       # integration tests use in-process S3 servers
 cargo build --release -p s3vault             # needs perl + make (vendored OpenSSL for SQLCipher)
 cargo build --release -p s3vault-keyd --target x86_64-unknown-linux-musl   # static, for the scratch image
 ```
@@ -85,17 +85,23 @@ build steps), `deploy/proxy/config.example.toml` as `/etc/s3vault/config.toml`,
 `deploy/proxy/s3vault.service` as `/etc/systemd/system/s3vault.service`, then:
 
 ```sh
+s3vault gen-admin-token --out /etc/s3vault/secrets/admin.token          # never printed
+chgrp s3vault /etc/s3vault/secrets/admin.token; chmod 640 /etc/s3vault/secrets/admin.token
 runuser -u s3vault -- s3vault check --config /etc/s3vault/config.toml   # validates; fetches the keyring
 systemctl enable --now s3vault
-curl -s 127.0.0.1:9101/status
+alias sva='curl -s -H "Authorization: Bearer $(cat /etc/s3vault/secrets/admin.token)"'
+sva 127.0.0.1:9101/status
 ```
+
+The admin API answers 401 without `Authorization: Bearer <token>`; `admin_listen` must be a loopback
+address and `admin_token_file` is required with it. The examples below use the `sva` alias.
 
 ## Unlock
 
 Automatic. At start the proxy is **locked** and answers every S3 request with 503; it asks the key service
 every `keys.retry_secs` (10 s) until it gets the keyring, then opens the encrypted index and serves. Once
 unlocked it stays unlocked while running, even if the key service goes away. A restart of the proxy while the key service is down stays
-locked (503) until the key service is back. `curl -X POST 127.0.0.1:9101/unlock` retries at once. `GET /status` shows
+locked (503) until the key service is back. `sva -X POST 127.0.0.1:9101/unlock` retries at once. `GET /status` shows
 `locked` and `unlock_error`.
 
 The index is encrypted with a key derived from the keyring, and it records the keyring fingerprint: a
@@ -119,11 +125,13 @@ Add a `[[clients]]` block with `buckets` (read-write) and/or `read_buckets` (rea
 ## Fill from the fallback
 
 ```sh
-curl -X POST '127.0.0.1:9101/fill/start?bucket=app&max_objects=1000&rate=500000&concurrency=4'
-curl -s 127.0.0.1:9101/fill                     # progress, cursor, errors, failed keys
-curl -X POST '127.0.0.1:9101/fill/stop?bucket=app'
-curl -X POST '127.0.0.1:9101/verify?bucket=app&max=1000&fallback=1'   # re-read and compare with the fallback
+sva -X POST '127.0.0.1:9101/fill/start?bucket=app&max_objects=1000&rate=500000&concurrency=4'
+sva 127.0.0.1:9101/fill                     # progress, cursor, errors, failed keys
+sva -X POST '127.0.0.1:9101/fill/stop?bucket=app'
+sva -X POST '127.0.0.1:9101/verify?bucket=app&max=1000&fallback=1'   # re-read and compare with the fallback
 ```
+
+`concurrency` is clamped to 1..32.
 
 The fill walks the fallback listing in key order with a resumable cursor (in the index), skips keys already
 in the store or tombstoned, copies create-only under a per-key lock, checks the body against the fallback's
@@ -136,19 +144,41 @@ goes stale when the fallback later overwrites or deletes that key. Reconcile dro
 came from the fallback; client writes and tombstones are never touched):
 
 ```sh
-curl -X POST '127.0.0.1:9101/reconcile?bucket=app&dry_run=1'   # counts and examples only
-curl -X POST '127.0.0.1:9101/reconcile?bucket=app'
+sva -X POST '127.0.0.1:9101/reconcile?bucket=app&dry_run=1'          # "stale": N, examples
+sva -X POST '127.0.0.1:9101/reconcile?bucket=app&expect=N'           # removes; N from the dry run
 ```
+
+Guards (a reconcile against an empty or unreachable fallback would otherwise drop every filled copy):
+
+- refused when the fallback's listing is empty (retired, re-created, wrong bucket), or when the bucket's
+  fallback is marked `retired = true` in the config (the fill refuses it too);
+- a key counts as deleted only when a direct HEAD answers 404; any other error aborts the run;
+- a real run needs `expect` equal to the dry run's `stale` (so a dry run always comes first), and is refused
+  when it would remove more than `fill.reconcile_max_fraction` (default 0.01) of the checked filled rows,
+  unless `force=1` is added after checking the fallback.
 
 Cutover of a client: stop its writes to the fallback, reconcile, run a last fill pass with `restart=1`, then
 point the client at s3vault.
 
 ## Rotate
 
-- **Content key**: `cd /srv/s3vault-keyd && docker compose run --rm rotate` (adds a key and makes it
-  active; old keys stay for reads), then copy the keyring to the offline backup again and
-  `systemctl restart s3vault` on the proxy. New writes use the new key; nothing is re-encrypted. Re-encrypting old objects is only needed after a
-  compromise (not built).
+- **Content key** (escrow first; review H2). A rotated key is **pending**: it is served but never used for
+  writes until an offline copy holding it is confirmed, so a key can never exist only on the key host.
+
+  ```sh
+  ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm rotate'          # prints the expected digest
+  (umask 077; ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T escrow-export' \
+     > ~/.s3vault/master.key.new)                                                 # never on a terminal
+  s3vault-keyd escrow-digest --file ~/.s3vault/master.key.new                     # where the copy is
+  mv ~/.s3vault/master.key.new ~/.s3vault/master.key                              # and the second offline copy
+  ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm escrow-confirm --digest <digest> --place <where>'
+  ssh root@<proxy> systemctl restart s3vault
+  ```
+
+  `escrow-confirm` compares the digest computed from the copy with the keyring and only then makes the key
+  active. The proxy enforces the same rule: it writes under the highest **escrowed** key (`/status`:
+  `write_kid`, `active_kid_escrowed`, `escrow_places`), so a hand-edited or old-binary rotation cannot
+  create data under an unescrowed key. Nothing is re-encrypted. Keep two offline copies in different places.
 - **Name key**: never rotates in place (every object would be renamed). Not supported.
 - **PSK**: stop keyd, replace `keys/psk` with a fresh `s3vault-psk v1 <base64 32 bytes>` (e.g. move the old
   files aside and run `init` in a scratch dir, keep only `psk`), start keyd, copy it to the proxy as above. Running
@@ -172,7 +202,9 @@ systemctl start s3vault
 
 `--snapshot` starts from the latest encrypted index snapshot (written every `index_snapshot_secs` when the
 index changed, or by `POST /snapshot`) and reads only headers of objects written since (store Last-Modified)
-or unknown to it. Without it, every header is read (one ranged GET of about 2 KiB per object; budget hours for
+or unknown to it. The snapshot is streamed and applied in transactions, and the name sets of the rebuild
+live in a scratch sqlite file next to the index (removed at the end), so RAM stays bounded at any index
+size (see `tests/scale.rs`; the production-size drill is described there). Without it, every header is read (one ranged GET of about 2 KiB per object; budget hours for
 millions of objects). Fill cursors and unfinished multipart uploads are not in the store and start over.
 
 Disaster recovery on a new host: same command with `--keyring-file ~/.s3vault/master.key`
@@ -212,7 +244,7 @@ rclone copy src:s3vault-store/o b2:<name>-vault/o --checksum --transfers 32
 
 Edit `[stores.primary]`: `endpoint = "https://s3.<region>.backblazeb2.com"`, `region = "<region>"`,
 `bucket = "<name>-vault"`, `credentials_file = "/etc/s3vault/secrets/store-b2.toml"`. Stop writes (or accept
-a short window), copy again, `systemctl restart s3vault`, check `/status` and `POST /verify`. The index stays
+a short window), copy again, `systemctl restart s3vault`, check `/status` and `POST /verify` (with the admin token). The index stays
 valid (it does not depend on the store endpoint). Then the old store can be stopped. Store-side multipart is used above 512 MiB of ciphertext; B2's
 minimum part size (5 MB) is respected.
 
@@ -247,7 +279,7 @@ Verify (the service is locked, 503, for a moment until the keyring arrives):
 ```sh
 systemctl is-active s3vault
 journalctl -u s3vault -n 20 --no-pager
-curl -s 127.0.0.1:9101/status        # "locked": false, "unlock_error": null, the same "keyring_fingerprint" as before
+sva 127.0.0.1:9101/status            # "locked": false, "unlock_error": null, the same "keyring_fingerprint" as before
 ss -ltnp | grep ':910[01]'           # 9100 only on loopback and the private address; 9101 only on loopback
 ```
 

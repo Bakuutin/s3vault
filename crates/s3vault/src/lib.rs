@@ -58,10 +58,20 @@ pub async fn start(cfg: config::Config) -> Result<Running> {
     if let Some(a) = &cfg.server.admin_listen {
         let l = server::bind(a)?;
         admin_addr = Some(l.local_addr()?);
+        let token_file = cfg
+            .server
+            .admin_token_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("admin_listen needs admin_token_file"))?;
+        let token = config::read_secret_line(token_file)?;
+        if token.len() < 32 {
+            anyhow::bail!("admin token in {} is too short (32+ characters)", token_file.display());
+        }
         let ctx = admin::AdminCtx {
             vault: vault.clone(),
             fills: fills.clone(),
             wake: wake.clone(),
+            token: Arc::new(zeroize::Zeroizing::new(token)),
         };
         tasks.push(tokio::spawn(admin::serve_admin(l, ctx, rx.clone())));
     }

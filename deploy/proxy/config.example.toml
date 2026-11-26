@@ -5,7 +5,8 @@
 [server]
 # Private addresses only: loopback and a private (e.g. Tailscale) address. Never a public IP.
 listen = ["127.0.0.1:9100", "100.64.0.2:9100"]
-admin_listen = "127.0.0.1:9101"
+admin_listen = "127.0.0.1:9101"          # loopback only
+admin_token_file = "/etc/s3vault/secrets/admin.token"   # s3vault gen-admin-token --out ...
 data_dir = "/var/lib/s3vault"
 region = "us-east-1"
 memory_spool_max = 16777216          # bodies above 16 MiB spool to encrypted local files
@@ -59,3 +60,4 @@ read_buckets = ["app"]
 concurrency = 4
 rate_bytes_per_sec = 1000000         # default fill budget; live read-through misses are not limited
 yield_ms = 250
+reconcile_max_fraction = 0.01        # reconcile refuses to drop more than 1% of filled rows without force=1

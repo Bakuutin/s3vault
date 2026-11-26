@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 
 const AK: &str = "backend-ak";
 const SK: &str = "backend-secret-key";
+const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef0123456789";
 
 /// An in-process S3 server (s3s-fs) on a random loopback port.
 struct FsS3 {
@@ -105,6 +106,7 @@ fn config_text(dir: &Path, store: SocketAddr, fallback: SocketAddr, keys: &str) 
 [server]
 listen = ["127.0.0.1:0"]
 admin_listen = "127.0.0.1:0"
+admin_token_file = "{dir}/admin.token"
 data_dir = "{data}"
 memory_spool_max = 100000
 store_multipart_threshold = 6000000
@@ -178,6 +180,7 @@ async fn setup() -> Env {
     );
     write(&dir.join("app.secret"), "app-secret\n");
     write(&dir.join("reader.secret"), "reader-secret\n");
+    write(&dir.join("admin.token"), &format!("{ADMIN_TOKEN}\n"));
     let keyring_path = dir.join("keyring");
     write(&keyring_path, &Keyring::generate().to_text());
     let keys = format!("source = \"file\"\nfile = \"{}\"", keyring_path.display());
@@ -292,6 +295,7 @@ fn all_files(root: &Path) -> Vec<PathBuf> {
 async fn admin_post(env: &Env, path: &str) -> serde_json::Value {
     let r = reqwest::Client::new()
         .post(format!("{}{path}", env.admin()))
+        .bearer_auth(ADMIN_TOKEN)
         .send()
         .await
         .unwrap();
@@ -300,7 +304,10 @@ async fn admin_post(env: &Env, path: &str) -> serde_json::Value {
 
 async fn admin_get(env: &Env, path: &str) -> serde_json::Value {
     serde_json::from_slice(
-        &reqwest::get(format!("{}{path}", env.admin()))
+        &reqwest::Client::new()
+            .get(format!("{}{path}", env.admin()))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
             .await
             .unwrap()
             .bytes()
@@ -1131,7 +1138,16 @@ async fn background_fill_and_verify() {
         ),
         (Some(1), Some(1), Some(0))
     );
-    let rec = admin_post(&env, "/reconcile?bucket=data").await;
+    assert_eq!(dry["stale"], 2);
+    // A real run needs the dry run's count; 2 of 10 is above the 1% default cap, so it also needs force.
+    let no_expect = admin_post(&env, "/reconcile?bucket=data").await;
+    assert!(no_expect["error"].as_str().unwrap().contains("dry_run"), "{no_expect}");
+    let wrong = admin_post(&env, "/reconcile?bucket=data&expect=3&force=1").await;
+    assert!(wrong["error"].as_str().unwrap().contains("does not match"), "{wrong}");
+    let capped = admin_post(&env, "/reconcile?bucket=data&expect=2").await;
+    assert!(capped["error"].as_str().unwrap().contains("cap"), "{capped}");
+    assert!(idx.get("data", "f/005").unwrap().is_some(), "nothing removed by a refused run");
+    let rec = admin_post(&env, "/reconcile?bucket=data&expect=2&force=1").await;
     assert_eq!(rec["removed"], 2);
     assert_eq!(rec["checked"], 10);
     assert_eq!(
@@ -1160,7 +1176,7 @@ async fn background_fill_and_verify() {
         TOMBSTONE,
         "tombstones untouched"
     );
-    let again = admin_post(&env, "/reconcile?bucket=data").await;
+    let again = admin_post(&env, "/reconcile?bucket=data&expect=0").await;
     assert_eq!(again["removed"], 0);
     let status = admin_get(&env, "/status").await;
     assert_eq!(status["locked"], false);
@@ -1183,6 +1199,7 @@ async fn locked_without_key_service_returns_503() {
         &dir.join("psk"),
         &s3vault_format::keyproto::generate_psk_text(),
     );
+    write(&dir.join("admin.token"), &format!("{ADMIN_TOKEN}\n"));
     // a key service that is not running
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
@@ -1260,4 +1277,194 @@ async fn locked_without_key_service_returns_503() {
     assert_eq!(get_all(&c, "plain", "k", None).await.unwrap(), b"x");
     running.shutdown().await;
     drop(fallback);
+}
+
+async fn admin_status_code(env: &Env, path: &str, token: Option<&str>) -> u16 {
+    let mut r = reqwest::Client::new().get(format!("{}{path}", env.admin()));
+    if let Some(t) = token {
+        r = r.bearer_auth(t);
+    }
+    r.send().await.unwrap().status().as_u16()
+}
+
+async fn wait_fill_idle(env: &Env) {
+    for _ in 0..200 {
+        let st = admin_get(env, "/fill").await;
+        if st[0]["running"] == false {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fill did not finish");
+}
+
+/// H3: every admin call needs the bearer token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_api_requires_token() {
+    let env = setup().await;
+    assert_eq!(admin_status_code(&env, "/status", None).await, 401);
+    assert_eq!(admin_status_code(&env, "/status", Some("wrong")).await, 401);
+    assert_eq!(
+        admin_status_code(&env, "/status", Some(&ADMIN_TOKEN[..ADMIN_TOKEN.len() - 1])).await,
+        401
+    );
+    assert_eq!(admin_status_code(&env, "/status", Some(ADMIN_TOKEN)).await, 200);
+    // The manifest lists index rows only (never the fallback).
+    env.rw
+        .put_object()
+        .bucket("data")
+        .key("m/1")
+        .body(ByteStream::from_static(b"m1"))
+        .send()
+        .await
+        .unwrap();
+    env.legacy
+        .put_object()
+        .bucket("legacy")
+        .key("m/0-unfilled")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let m = admin_get(&env, "/manifest?bucket=data").await;
+    assert_eq!(m["items"].as_array().unwrap().len(), 1, "{m}");
+    assert_eq!(m["items"][0]["key"], "m/1");
+    assert_eq!(
+        m["items"][0]["sha256"],
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"m1"))
+    );
+    assert_eq!(admin_status_code(&env, "/manifest?bucket=data", None).await, 401);
+    let r = reqwest::Client::new()
+        .post(format!("{}/reconcile?bucket=data&expect=0&force=1", env.admin()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401, "unauthenticated reconcile refused");
+    // A non-loopback admin listener or a missing token file is a config error.
+    let mut cfg = env.cfg.clone();
+    cfg.server.admin_listen = Some("0.0.0.0:9101".into());
+    assert!(cfg.validate().is_err());
+    let mut cfg = env.cfg.clone();
+    cfg.server.admin_token_file = None;
+    assert!(cfg.validate().is_err());
+    env.running.unwrap().shutdown().await;
+}
+
+/// H3: reconcile never removes filled copies because the fallback lists empty, is unreachable or retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_refuses_empty_unreachable_or_retired_fallback() {
+    let mut env = setup().await;
+    for i in 0..6 {
+        env.legacy
+            .put_object()
+            .bucket("legacy")
+            .key(format!("r/{i}"))
+            .body(ByteStream::from(data(100 + i, i as u8)))
+            .send()
+            .await
+            .unwrap();
+    }
+    admin_post(&env, "/fill/start?bucket=data").await;
+    wait_fill_idle(&env).await;
+    let idx = env.vault().unlocked().unwrap().index.clone();
+    assert_eq!(idx.counts("data").unwrap().0, 6);
+
+    // Empty fallback (retired, re-created or the wrong bucket): refused, nothing removed.
+    for i in 0..6 {
+        env.legacy
+            .delete_object()
+            .bucket("legacy")
+            .key(format!("r/{i}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let dry = admin_post(&env, "/reconcile?bucket=data&dry_run=1").await;
+    assert!(dry["error"].as_str().unwrap().contains("lists no objects"), "{dry}");
+    let real = admin_post(&env, "/reconcile?bucket=data&expect=6&force=1").await;
+    assert!(real["error"].as_str().unwrap().contains("lists no objects"), "{real}");
+    assert_eq!(idx.counts("data").unwrap().0, 6, "no filled row removed");
+
+    // Unreachable fallback: an error, never "deleted".
+    env.legacy
+        .put_object()
+        .bucket("legacy")
+        .key("r/0")
+        .body(ByteStream::from(data(100, 0)))
+        .send()
+        .await
+        .unwrap();
+    env.fallback.kill();
+    let down = admin_post(&env, "/reconcile?bucket=data&dry_run=1").await;
+    assert!(down["error"].is_string(), "{down}");
+    let down = admin_post(&env, "/reconcile?bucket=data&expect=5&force=1").await;
+    assert!(down["error"].is_string(), "{down}");
+    assert_eq!(idx.counts("data").unwrap().0, 6);
+
+    // Back up with one object: 5 of 6 gone is far above the cap; only force plus the exact count removes.
+    env.fallback = start_fs_s3(&env.dir.join("fallback"), Some(env.fallback.addr)).await;
+    let dry = admin_post(&env, "/reconcile?bucket=data&dry_run=1").await;
+    assert_eq!(dry["stale"], 5, "{dry}");
+    assert_eq!(dry["removed"], 0);
+    let capped = admin_post(&env, "/reconcile?bucket=data&expect=5").await;
+    assert!(capped["error"].as_str().unwrap().contains("cap"), "{capped}");
+    assert_eq!(idx.counts("data").unwrap().0, 6);
+
+    // A fallback marked retired: fill and reconcile refuse outright.
+    let mut cfg = env.cfg.clone();
+    cfg.buckets[0].fallback.as_mut().unwrap().retired = true;
+    cfg.server.listen = vec![];
+    cfg.server.admin_listen = None;
+    cfg.server.data_dir = env.dir.join("retired-data");
+    let v = s3vault::vault::Vault::new(cfg).unwrap();
+    v.unlock(Keyring::parse(&std::fs::read_to_string(&env.keyring_path).unwrap()).unwrap())
+        .unwrap();
+    let e = s3vault::background::reconcile(
+        v.clone(),
+        "data",
+        s3vault::background::ReconcileOpts {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("retired"), "{e}");
+    let fills = std::sync::Arc::new(s3vault::background::Fills::default());
+    assert!(fills.start(v, "data", None, 1000, 1, false).unwrap_err().contains("retired"));
+    env.running.take().unwrap().shutdown().await;
+}
+
+/// H2: a rotated key that is not escrowed is never used for writes, even if a keyring marks it active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotation_escrow_gate_in_proxy() {
+    let env = setup().await;
+    let mut kr = Keyring::parse(&std::fs::read_to_string(&env.keyring_path).unwrap()).unwrap();
+    let fp = kr.fingerprint();
+    kr.rotate().unwrap();
+    // a hand edit that activates the pending key without an escrow record
+    let text = kr.to_text().replace("active 1", "active 2").replace("pending 2\n", "");
+    let open = |text: &str, sub: &str| {
+        let mut cfg = env.cfg.clone();
+        cfg.server.listen = vec![];
+        cfg.server.admin_listen = None;
+        cfg.server.data_dir = env.dir.join(sub);
+        let v = s3vault::vault::Vault::new(cfg).unwrap();
+        v.unlock(Keyring::parse(text).unwrap()).unwrap();
+        v
+    };
+    let v = open(&text, "gate-a");
+    let put = |v: std::sync::Arc<s3vault::vault::Vault>, key: &'static str| async move {
+        let body: s3vault::remote::ByteStream =
+            Box::pin(futures::stream::once(async { Ok(bytes::Bytes::from_static(b"x")) }));
+        v.put("plain", key, body, Default::default()).await.unwrap();
+        v.unlocked().unwrap().index.get("plain", key).unwrap().unwrap().kid
+    };
+    assert_eq!(put(v.clone(), "before-escrow").await, 1, "unescrowed key 2 not used");
+    // After the escrow is confirmed with the copy's digest, key 2 is used; the fingerprint is unchanged.
+    kr.confirm_escrow(&kr.escrow_digest(), "owner-mac", 1).unwrap();
+    let v2 = open(&kr.to_text(), "gate-b");
+    assert_eq!(put(v2.clone(), "after-escrow").await, 2);
+    assert_eq!(v2.unlocked().unwrap().keyring.fingerprint(), fp);
+    env.running.unwrap().shutdown().await;
 }

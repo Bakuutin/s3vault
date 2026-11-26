@@ -359,3 +359,37 @@ impl Remote {
             .map(|_| ())
     }
 }
+
+/// The read side of a store that the rebuild needs. [`Remote`] implements it; the scale drill wraps it to
+/// synthesise a listing of millions of names without storing millions of objects.
+#[async_trait::async_trait]
+pub trait StoreView: Send + Sync {
+    async fn list_page(&self, prefix: &str, token: Option<&str>, max: usize) -> RResult<ListPage>;
+    async fn get_stream(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> RResult<(RemoteMeta, ByteStream)>;
+    async fn get_bytes(&self, key: &str, range: Option<(u64, u64)>) -> RResult<Bytes> {
+        let (_, mut s) = self.get_stream(key, range).await?;
+        let mut buf = Vec::new();
+        while let Some(c) = s.next().await {
+            buf.extend_from_slice(&c.map_err(unavailable)?);
+        }
+        Ok(Bytes::from(buf))
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreView for Remote {
+    async fn list_page(&self, prefix: &str, token: Option<&str>, max: usize) -> RResult<ListPage> {
+        self.list(prefix, None, token, max).await
+    }
+    async fn get_stream(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> RResult<(RemoteMeta, ByteStream)> {
+        Remote::get_stream(self, key, range).await
+    }
+}

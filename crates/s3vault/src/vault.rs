@@ -86,6 +86,8 @@ pub struct BucketRt {
     pub name: String,
     pub store: Arc<Remote>,
     pub fallback: Option<Arc<Remote>>,
+    /// Fill and reconcile refuse to run against a retired fallback.
+    pub fallback_retired: bool,
 }
 
 pub struct Unlocked {
@@ -236,6 +238,7 @@ impl Vault {
                     name: b.name.clone(),
                     store: stores[&b.store].clone(),
                     fallback,
+                    fallback_retired: b.fallback.as_ref().is_some_and(|f| f.retired),
                 }),
             );
         }

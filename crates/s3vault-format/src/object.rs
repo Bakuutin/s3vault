@@ -222,7 +222,7 @@ pub struct SealedHead {
 pub fn seal_head(kr: &Keyring, header: &Header) -> Result<SealedHead> {
     let mut salt = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    seal_head_with(kr, kr.active_kid, salt, header)
+    seal_head_with(kr, kr.write_kid(), salt, header)
 }
 
 pub fn seal_head_with(
@@ -538,7 +538,11 @@ mod tests {
         let (c1, _) = seal_all(&kr, &h1, b"x").unwrap();
         let (c2, _) = seal_all(&kr, &h2, b"x").unwrap();
         assert_eq!(c1.len(), c2.len());
-        kr.rotate();
+        kr.rotate().unwrap();
+        let (c_pending, i_pending) = seal_all(&kr, &h1, b"x").unwrap();
+        assert_eq!(i_pending.kid, 1, "a pending key is not used for writes");
+        assert_eq!(open_head(&kr, &c_pending).unwrap().0.key, "a");
+        kr.confirm_escrow(&kr.escrow_digest(), "mac", 1).unwrap();
         let (c3, i3) = seal_all(&kr, &h1, b"x").unwrap();
         assert_eq!(i3.kid, 2);
         assert_eq!(open_head(&kr, &c1).unwrap().0.key, "a");

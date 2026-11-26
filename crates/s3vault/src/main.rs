@@ -6,6 +6,7 @@
 //! s3vault check   --config FILE            validate the config and fetch the keyring (prints the fingerprint)
 //! s3vault gen-client --secret-out FILE     new client access key id (printed) and secret (written, mode 600)
 //! s3vault gen-keyring --out FILE           new keyring file (mode 600) for tests; production uses s3vault-keyd init
+//! s3vault gen-admin-token --out FILE       new admin API bearer token (written, mode 600; never printed)
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -118,6 +119,15 @@ fn main() -> Result<()> {
             println!("access_key_id = \"{access}\"\nsecret_file = \"{out}\"");
             Ok(())
         }
+        "gen-admin-token" => {
+            let out = need(&args, "--out")?;
+            let mut t = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut t);
+            let tok = zeroize::Zeroizing::new(data_encoding::BASE64URL_NOPAD.encode(&t));
+            write_secret_file(&out, format!("{}\n", tok.as_str()).as_bytes())?;
+            println!("admin token written to {out}");
+            Ok(())
+        }
         "gen-keyring" => {
             let out = need(&args, "--out")?;
             let kr = s3vault_format::keyring::Keyring::generate();
@@ -127,7 +137,7 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: s3vault serve|check|rebuild|gen-client|gen-keyring ... (see README.md)"
+                "usage: s3vault serve|check|rebuild|gen-client|gen-admin-token|gen-keyring ... (see README.md)"
             );
             std::process::exit(2)
         }
