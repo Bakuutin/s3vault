@@ -26,8 +26,11 @@ pub const SCOPED_CAPS: &[&str] = &["listBuckets", "listFiles", "readFiles", "wri
 /// with any capability), which is why it never goes to the proxy.
 pub const ADMIN_CAPS: &[&str] = &[
     "listBuckets",
+    "readBuckets",
     "writeBuckets",
     "deleteBuckets",
+    "readBucketLifecycleRules",
+    "writeBucketLifecycleRules",
     "listKeys",
     "writeKeys",
     "deleteKeys",
