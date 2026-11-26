@@ -8,7 +8,8 @@ object reads back byte-identical through the gateway.
   s3sum.py ... --bucket B --keys-from KEYS.txt     read only these keys (one per line), no listing
   s3sum.py ... --list-only [--region garage --toml-credentials]   list `<size> <key>` (e.g. the store itself)
   s3sum.py ... --prefix o/<tag>/ --pull-to DIR    raw copy of one tenant's objects (a per-tenant follower copy)
-  s3sum.py ... --push-from DIR                    upload them back (a restore; replay the ledger afterwards)
+  s3sum.py ... --push-from DIR [--skip-existing]  upload them back (a restore; replay the ledger afterwards), or
+                                                  copy a tenant to a new store (README, B2 switch); PUTs retry
 
 For a bucket with a read-through fallback, use --keys-from with the keys of the admin `GET /manifest`
 (keys already in the store), so the check never reads through from (or fills from) the fallback.
@@ -21,6 +22,7 @@ import datetime
 import hashlib
 import hmac
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -60,10 +62,31 @@ def get(url, ak, sk):
     return urllib.request.urlopen(req, timeout=120)
 
 
-def put(url, ak, sk, body):
-    h = sign("PUT", url, ak, sk, REGION, hashlib.sha256(body).hexdigest())
-    req = urllib.request.Request(url, data=body, method="PUT", headers=h)
-    return urllib.request.urlopen(req, timeout=120).read()
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def put(url, ak, sk, body, attempts=6):
+    """PUT with bounded exponential backoff and jitter (B2 answers 500/503 under load); a whole-object PUT
+    is idempotent, so every attempt re-signs and resends the same bytes."""
+    import random
+    import time
+    payload = hashlib.sha256(body).hexdigest()
+    for n in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, data=body, method="PUT", headers=sign("PUT", url, ak, sk, REGION, payload))
+            return urllib.request.urlopen(req, timeout=600).read()
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUS or n == attempts:
+                raise
+            err = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if n == attempts:
+                raise
+            err = type(e).__name__
+        cap = min(30.0, 0.5 * 2 ** (n - 1))
+        d = random.uniform(cap / 2, cap)
+        print(f"# put attempt {n} failed ({err}), retrying in {d:.1f}s", file=sys.stderr)
+        time.sleep(d)
 
 
 def digest(a, sk, key):
@@ -79,6 +102,27 @@ def digest(a, sk, key):
     return f"{h.hexdigest()} {size}"
 
 
+def list_sizes(a, sk):
+    """`{key: size}` of the bucket (under --prefix)."""
+    ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+    out, token = {}, None
+    while True:
+        q = {"list-type": "2", "max-keys": "1000"}
+        if a.prefix:
+            q["prefix"] = a.prefix
+        if token:
+            q["continuation-token"] = token
+        url = f"{a.endpoint}/{a.bucket}?" + urllib.parse.urlencode(sorted(q.items()), quote_via=urllib.parse.quote)
+        root = ET.fromstring(get(url, a.access_key, sk).read())
+        for c in root.findall(f"{ns}Contents"):
+            out[c.find(f"{ns}Key").text] = int(c.findtext(f"{ns}Size"))
+        t = root.find(f"{ns}NextContinuationToken")
+        if root.findtext(f"{ns}IsTruncated") == "true" and t is not None:
+            token = t.text
+        else:
+            return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--endpoint", required=True)
@@ -91,6 +135,7 @@ def main():
     p.add_argument("--list-only", action="store_true", help="print `<size> <key>` without reading objects")
     p.add_argument("--toml-credentials", action="store_true", help="the secret file is a TOML credentials file")
     p.add_argument("--pull-to", help="copy every listed object (raw bytes) into this directory (a follower copy)")
+    p.add_argument("--skip-existing", action="store_true", help="with --push-from: skip keys the bucket already holds with the same size (resume)")
     p.add_argument("--push-from", help="upload every file below this directory under its relative path (a restore)")
     a = p.parse_args()
     global REGION
@@ -100,14 +145,19 @@ def main():
         sk = [l.split("=", 1)[1].strip().strip('"') for l in sk.splitlines() if l.startswith("secret_access_key")][0]
     if a.push_from:
         import os
-        n = 0
+        have = list_sizes(a, sk) if a.skip_existing else {}
+        n = skipped = 0
         for root, _, files in os.walk(a.push_from):
             for f in sorted(files):
                 path = os.path.join(root, f)
                 key = os.path.relpath(path, a.push_from)
-                put(f"{a.endpoint}/{a.bucket}/{urllib.parse.quote(key, safe='/-_.~')}", a.access_key, sk, open(path, "rb").read())
+                if have.get(key) == os.path.getsize(path):
+                    skipped += 1
+                    continue
+                with open(path, "rb") as fh:
+                    put(f"{a.endpoint}/{a.bucket}/{urllib.parse.quote(key, safe='/-_.~')}", a.access_key, sk, fh.read())
                 n += 1
-        print(f"# pushed {n} objects", file=sys.stderr)
+        print(f"# pushed {n} objects, skipped {skipped} already present with the same size", file=sys.stderr)
         return
     if a.keys_from:
         keys = [k.rstrip("\n") for k in open(a.keys_from) if k.strip()]
