@@ -25,7 +25,9 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAGIC: &[u8; 8] = b"S3VKEY01";
-const MAX_PAYLOAD: usize = 64 * 1024;
+/// Protocol v2: same handshake; the payload is a [`crate::keys2::Bundle`] (master, tenants, ledger).
+pub const MAGIC2: &[u8; 8] = b"S3VKEY02";
+const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -85,10 +87,19 @@ pub fn client_fetch<S: Read + Write>(
     s: &mut S,
     psk: &[u8; 32],
 ) -> std::result::Result<Zeroizing<Vec<u8>>, ProtoError> {
+    client_fetch_with(s, psk, MAGIC)
+}
+
+/// Client side with an explicit protocol magic ([`MAGIC`] or [`MAGIC2`]).
+pub fn client_fetch_with<S: Read + Write>(
+    s: &mut S,
+    psk: &[u8; 32],
+    magic: &[u8; 8],
+) -> std::result::Result<Zeroizing<Vec<u8>>, ProtoError> {
     let mut cn = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut cn);
     let mut hello = Vec::with_capacity(40);
-    hello.extend_from_slice(MAGIC);
+    hello.extend_from_slice(magic);
     hello.extend_from_slice(&cn);
     s.write_all(&hello)?;
     s.flush()?;
@@ -114,7 +125,7 @@ pub fn client_fetch<S: Read + Write>(
             &XNonce::default(),
             Payload {
                 msg: &ct,
-                aad: MAGIC,
+                aad: magic,
             },
         )
         .map_err(|_| ProtoError::Auth)?;
@@ -127,14 +138,25 @@ pub fn server_serve<S: Read + Write>(
     psk: &[u8; 32],
     payload: &[u8],
 ) -> std::result::Result<(), ProtoError> {
-    if payload.len() > MAX_PAYLOAD {
-        return Err(ProtoError::Proto("payload too large"));
-    }
+    server_serve_versioned(s, psk, |_| Ok(Zeroizing::new(payload.to_vec()))).map(|_| ())
+}
+
+/// Server side that picks the payload by the client's protocol version (1 or 2), after the client has
+/// authenticated. Returns the version served.
+pub fn server_serve_versioned<S: Read + Write>(
+    s: &mut S,
+    psk: &[u8; 32],
+    payload_for: impl FnOnce(u8) -> std::result::Result<Zeroizing<Vec<u8>>, String>,
+) -> std::result::Result<u8, ProtoError> {
     let mut hello = [0u8; 40];
     s.read_exact(&mut hello)?;
-    if &hello[..8] != MAGIC {
+    let (version, magic) = if &hello[..8] == MAGIC {
+        (1u8, MAGIC)
+    } else if &hello[..8] == MAGIC2 {
+        (2u8, MAGIC2)
+    } else {
         return Err(ProtoError::Proto("bad magic"));
-    }
+    };
     let cn: [u8; 32] = hello[8..].try_into().unwrap();
     let mut sn = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut sn);
@@ -149,19 +171,24 @@ pub fn server_serve<S: Read + Write>(
     if !bool::from(want.ct_eq(&ctag)) {
         return Err(ProtoError::Auth);
     }
+    let payload = payload_for(version).map_err(|_| ProtoError::Proto("payload unavailable"))?;
+    let max = if version == 1 { 64 * 1024 } else { MAX_PAYLOAD };
+    if payload.len() > max {
+        return Err(ProtoError::Proto("payload too large"));
+    }
     let ct = transport(psk, &cn, &sn)
         .encrypt(
             &XNonce::default(),
             Payload {
-                msg: payload,
-                aad: MAGIC,
+                msg: &payload,
+                aad: magic,
             },
         )
         .expect("encrypt");
     s.write_all(&(ct.len() as u32).to_be_bytes())?;
     s.write_all(&ct)?;
     s.flush()?;
-    Ok(())
+    Ok(version)
 }
 
 #[cfg(test)]
@@ -193,6 +220,25 @@ mod tests {
         let (r, ok) = run([1; 32], [2; 32]);
         assert!(matches!(r, Err(ProtoError::Auth)));
         assert!(!ok);
+    }
+
+    #[test]
+    fn versioned_payloads() {
+        for (magic, want) in [(MAGIC, b"v1 payload".as_slice()), (MAGIC2, b"v2 payload".as_slice())] {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let h = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                server_serve_versioned(&mut s, &[3; 32], |v| {
+                    Ok(Zeroizing::new(format!("v{v} payload").into_bytes()))
+                })
+                .unwrap()
+            });
+            let mut c = TcpStream::connect(addr).unwrap();
+            let got = client_fetch_with(&mut c, &[3; 32], magic).unwrap();
+            assert_eq!(&got[..], want);
+            assert_eq!(h.join().unwrap(), if magic == MAGIC { 1 } else { 2 });
+        }
     }
 
     #[test]

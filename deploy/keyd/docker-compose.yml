@@ -24,6 +24,16 @@ services:
       options: { max-size: "1m", max-file: "3" }
 
   # One-shot helpers (profile "admin" keeps them out of `up`).
+  # Generic admin entry: docker compose run --rm admin <command> --dir /keys [...]
+  # (tenant-create, tenant-erase, tenant-list, escrow-cat, tenant-escrow-confirm, escrow-prune,
+  #  escrow-confirm, rotate, upgrade-v2, ledger-import, ledger-show, fingerprint). No network.
+  admin:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    entrypoint: ["/s3vault-keyd"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys
   init:
     profiles: ["admin"]
     image: s3vault-keyd:local

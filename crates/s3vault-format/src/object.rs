@@ -27,13 +27,17 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const MAGIC: [u8; 8] = *b"S3VAULT1";
+/// Object format v2 (tenant keys; see the v2 section below).
+pub const MAGIC2: [u8; 8] = *b"S3VAULT2";
+/// v2: the tenant box between the preamble and the sealed header (16-byte id + 16-byte tag).
+pub const TBOX_LEN: usize = 32;
 pub const PREAMBLE_LEN: usize = 64;
 pub const CHUNK: usize = 64 * 1024;
 pub const TAG: usize = 16;
 pub const SEALED_CHUNK: usize = CHUNK + TAG;
 pub const HEADER_BLOCK: usize = 1024;
 /// Bytes to fetch to read the header of any object whose header fits the default 2 KiB padding class.
-pub const HEAD_PROBE_LEN: usize = PREAMBLE_LEN + 2 * HEADER_BLOCK + TAG;
+pub const HEAD_PROBE_LEN: usize = PREAMBLE_LEN + TBOX_LEN + 2 * HEADER_BLOCK + TAG;
 
 /// The plaintext header carried (encrypted) by every stored object. It makes each object self-describing,
 /// so the store plus the keyring rebuilds the whole index.
@@ -64,6 +68,8 @@ pub struct Header {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preamble {
+    /// 1 or 2 (from the magic).
+    pub version: u8,
     pub kid: u32,
     pub flags: u32,
     pub salt: [u8; 32],
@@ -74,7 +80,7 @@ pub struct Preamble {
 impl Preamble {
     pub fn encode(&self) -> [u8; PREAMBLE_LEN] {
         let mut b = [0u8; PREAMBLE_LEN];
-        b[0..8].copy_from_slice(&MAGIC);
+        b[0..8].copy_from_slice(if self.version == 2 { &MAGIC2 } else { &MAGIC });
         b[8..12].copy_from_slice(&self.kid.to_be_bytes());
         b[12..16].copy_from_slice(&self.flags.to_be_bytes());
         b[16..48].copy_from_slice(&self.salt);
@@ -87,13 +93,18 @@ impl Preamble {
         if b.len() < PREAMBLE_LEN {
             return Err(FormatError::Malformed("short preamble"));
         }
-        if b[0..8] != MAGIC {
+        let version = if b[0..8] == MAGIC {
+            1
+        } else if b[0..8] == MAGIC2 {
+            2
+        } else {
             return Err(FormatError::Malformed("bad magic"));
-        }
+        };
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
         let mut salt = [0u8; 32];
         salt.copy_from_slice(&b[16..48]);
         let p = Preamble {
+            version,
             kid: u32_at(8),
             flags: u32_at(12),
             salt,
@@ -236,6 +247,7 @@ pub fn seal_head_with(
     let padded = json.len().div_ceil(HEADER_BLOCK).max(1) * HEADER_BLOCK;
     json.resize(padded, 0);
     let pre = Preamble {
+        version: 1,
         kid,
         flags: 0,
         salt,
@@ -273,6 +285,9 @@ pub fn seal_head_with(
 /// preamble and the sealed header (see [`needed_head_len`]).
 pub fn open_head(kr: &Keyring, bytes: &[u8]) -> Result<(Header, SealInfo)> {
     let pre = Preamble::decode(bytes)?;
+    if pre.version != 1 {
+        return Err(FormatError::Malformed("not a v1 object"));
+    }
     let end = PREAMBLE_LEN + pre.header_sealed_len as usize;
     if bytes.len() < end {
         return Err(FormatError::Malformed("short header"));
@@ -374,6 +389,183 @@ pub fn open_range(
         out.extend_from_slice(&plain[a..b]);
     }
     Ok(out)
+}
+
+// ------------------------------------------------------------------------------------------ format v2
+//
+// ```text
+// store name: <prefix><tag_t>/<base32(HMAC-SHA256(K_nm_t, "v2" || bucket || 0x00 || key))>
+// object:     preamble (64 B, plain, magic "S3VAULT2"; the length field counts tenant box + sealed header)
+//             tenant box (32 B): XChaCha20-Poly1305(K_tbox, nonce = salt[..24], AD = preamble, id_t)
+//             sealed header: XChaCha20-Poly1305(K_obj, nonce "s3vault/hdr", AD = preamble || tenant box)
+//             body: as v1, AD = SHA-256(preamble || tenant box || sealed header)
+// K_obj = HKDF(KEK[kid] || K_t, salt, "s3vault/v2/object" || id_t)   (see keys2)
+// ```
+//
+// The tenant box tells a rebuild with the root which tenant key opens the header. Once K_t is destroyed
+// the root still opens the box (an opaque tenant id), but nothing else.
+
+use crate::keys2::{MasterV2, TenantKeys};
+
+/// Seal a v2 head (preamble, tenant box, header) for tenant `tk` under KEK generation `kid`.
+pub fn seal_head_v2(tk: &TenantKeys, kid: u32, salt: [u8; 32], header: &Header) -> Result<SealedHead> {
+    let k_obj = tk.object_key(kid, &salt);
+    let mut json = serde_json::to_vec(header).map_err(|_| FormatError::Malformed("header json"))?;
+    let padded = json.len().div_ceil(HEADER_BLOCK).max(1) * HEADER_BLOCK;
+    json.resize(padded, 0);
+    let pre = Preamble {
+        version: 2,
+        kid,
+        flags: 0,
+        salt,
+        header_sealed_len: (TBOX_LEN + padded + TAG) as u32,
+        chunk_size: CHUNK as u32,
+    };
+    let pre_bytes = pre.encode();
+    let tbox_aead = XChaCha20Poly1305::new((&*tk.master.tenant_box_key()).into());
+    let tbox = tbox_aead
+        .encrypt(
+            XNonce::from_slice(&salt[..24]),
+            Payload {
+                msg: &tk.id,
+                aad: &pre_bytes,
+            },
+        )
+        .expect("encrypt");
+    debug_assert_eq!(tbox.len(), TBOX_LEN);
+    let mut ad_hdr = Vec::with_capacity(PREAMBLE_LEN + TBOX_LEN);
+    ad_hdr.extend_from_slice(&pre_bytes);
+    ad_hdr.extend_from_slice(&tbox);
+    let sealed = XChaCha20Poly1305::new((&*k_obj).into())
+        .encrypt(
+            &XNonce::from(HEADER_NONCE),
+            Payload {
+                msg: &json,
+                aad: &ad_hdr,
+            },
+        )
+        .expect("encrypt");
+    let mut prefix = ad_hdr;
+    prefix.extend_from_slice(&sealed);
+    let ad: [u8; 32] = Sha256::digest(&prefix).into();
+    Ok(SealedHead {
+        info: SealInfo {
+            kid,
+            salt,
+            header_sealed_len: pre.header_sealed_len,
+            ad,
+        },
+        body: ChunkCipher::new(&k_obj, ad),
+        prefix,
+    })
+}
+
+/// A new v2 head with a random salt under the tenant's write generation.
+pub fn seal_head_v2_new(tk: &TenantKeys, header: &Header) -> Result<SealedHead> {
+    let mut salt = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    seal_head_v2(tk, tk.write_kid(), salt, header)
+}
+
+/// The tenant id in a v2 object's tenant box (needs only the master keyring). `bytes` must hold the
+/// preamble and the box.
+pub fn open_tenant_box(master: &MasterV2, bytes: &[u8]) -> Result<[u8; 16]> {
+    let pre = Preamble::decode(bytes)?;
+    if pre.version != 2 {
+        return Err(FormatError::Malformed("not a v2 object"));
+    }
+    let tbox = bytes
+        .get(PREAMBLE_LEN..PREAMBLE_LEN + TBOX_LEN)
+        .ok_or(FormatError::Malformed("short tenant box"))?;
+    let id = XChaCha20Poly1305::new((&*master.tenant_box_key()).into())
+        .decrypt(
+            XNonce::from_slice(&pre.salt[..24]),
+            Payload {
+                msg: tbox,
+                aad: &bytes[..PREAMBLE_LEN],
+            },
+        )
+        .map_err(|_| FormatError::Auth)?;
+    id.try_into().map_err(|_| FormatError::Malformed("tenant id"))
+}
+
+/// Open a v2 head with tenant `tk`. Fails with [`FormatError::Auth`] for another tenant's object.
+pub fn open_head_v2(tk: &TenantKeys, bytes: &[u8]) -> Result<(Header, SealInfo)> {
+    let pre = Preamble::decode(bytes)?;
+    if pre.version != 2 {
+        return Err(FormatError::Malformed("not a v2 object"));
+    }
+    let end = PREAMBLE_LEN + pre.header_sealed_len as usize;
+    if bytes.len() < end || (pre.header_sealed_len as usize) < TBOX_LEN + HEADER_BLOCK + TAG {
+        return Err(FormatError::Malformed("short header"));
+    }
+    if open_tenant_box(&tk.master, bytes)? != tk.id {
+        return Err(FormatError::Auth);
+    }
+    let k_obj = tk.object_key(pre.kid, &pre.salt);
+    let ad_end = PREAMBLE_LEN + TBOX_LEN;
+    let mut plain = XChaCha20Poly1305::new((&*k_obj).into())
+        .decrypt(
+            &XNonce::from(HEADER_NONCE),
+            Payload {
+                msg: &bytes[ad_end..end],
+                aad: &bytes[..ad_end],
+            },
+        )
+        .map_err(|_| FormatError::Auth)?;
+    while plain.last() == Some(&0) {
+        plain.pop();
+    }
+    let header: Header =
+        serde_json::from_slice(&plain).map_err(|_| FormatError::Malformed("header json"))?;
+    let ad: [u8; 32] = Sha256::digest(&bytes[..end]).into();
+    Ok((
+        header,
+        SealInfo {
+            kid: pre.kid,
+            salt: pre.salt,
+            header_sealed_len: pre.header_sealed_len,
+            ad,
+        },
+    ))
+}
+
+/// The body cipher of a v2 object whose seal info is known.
+pub fn body_cipher_v2(tk: &TenantKeys, info: &SealInfo) -> ChunkCipher {
+    ChunkCipher::new(&tk.object_key(info.kid, &info.salt), info.ad)
+}
+
+/// v2 store name (without the store prefix): `<tag>/<keyed hash>`.
+pub fn store_name_v2(tk: &TenantKeys, bucket: &str, key: &str) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&tk.name_key[..]).expect("hmac key");
+    mac.update(b"v2");
+    mac.update(bucket.as_bytes());
+    mac.update(&[0]);
+    mac.update(key.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    format!(
+        "{}/{}",
+        tk.tag,
+        data_encoding::BASE32_NOPAD.encode(&tag).to_ascii_lowercase()
+    )
+}
+
+/// Seal a whole in-memory plaintext as a v2 object (tests and small objects).
+pub fn seal_all_v2(tk: &TenantKeys, header: &Header, plain: &[u8]) -> Result<(Vec<u8>, SealInfo)> {
+    let head = seal_head_v2_new(tk, header)?;
+    let layout = Layout {
+        header_sealed_len: head.info.header_sealed_len as u64,
+        size: plain.len() as u64,
+    };
+    let mut out = Vec::with_capacity(layout.total_len() as usize);
+    out.extend_from_slice(&head.prefix);
+    for i in 0..layout.n_chunks() {
+        let s = (i as usize) * CHUNK;
+        let e = (s + CHUNK).min(plain.len());
+        out.extend_from_slice(&head.body.seal(i, layout.is_last(i), &plain[s..e]));
+    }
+    debug_assert_eq!(out.len() as u64, layout.total_len());
+    Ok((out, head.info))
 }
 
 #[cfg(test)]
@@ -567,5 +759,85 @@ mod tests {
                 "audio/1/000001.opus"
             )
         );
+    }
+
+    fn tenant(m: &std::sync::Arc<MasterV2>, name: &str) -> TenantKeys {
+        let mut tk = crate::keys2::TenantKeyring::default();
+        tk.create(name, 1).unwrap();
+        m.tenant_keys(&tk.tenants[name]).unwrap()
+    }
+
+    #[test]
+    fn v2_roundtrip_ranges_and_tenant_isolation() {
+        let m = std::sync::Arc::new(MasterV2::generate(None));
+        let a = tenant(&m, "a");
+        let b = tenant(&m, "b");
+        for n in [0, 1, CHUNK, 3 * CHUNK + 17] {
+            let plain = data(n);
+            let (ct, info) = seal_all_v2(&a, &header(n as u64), &plain).unwrap();
+            assert_eq!(&ct[..8], b"S3VAULT2");
+            let (h, info2) = open_head_v2(&a, &ct).unwrap();
+            assert_eq!(h.size, n as u64);
+            assert_eq!(info, info2);
+            assert_eq!(open_tenant_box(&m, &ct).unwrap(), a.id);
+            let layout = Layout {
+                header_sealed_len: info.header_sealed_len as u64,
+                size: n as u64,
+            };
+            assert_eq!(layout.total_len() as usize, ct.len());
+            let c = body_cipher_v2(&a, &info);
+            let last = layout.n_chunks() - 1;
+            let (s, e) = layout.ciphertext_span(0, last);
+            let got =
+                open_range(&c, &layout, 0, last, &ct[s as usize..=e as usize], 0, n as u64).unwrap();
+            assert_eq!(got, plain);
+            // another tenant, the v1 opener and another master cannot open it
+            assert!(open_head_v2(&b, &ct).is_err());
+            assert!(open_head(&Keyring::generate(), &ct).is_err());
+            let other = std::sync::Arc::new(MasterV2::generate(None));
+            assert!(open_tenant_box(&other, &ct).is_err());
+        }
+        // names: per tenant, with the tenant tag as a folder
+        let na = store_name_v2(&a, "data", "k");
+        let nb = store_name_v2(&b, "data", "k");
+        assert_ne!(na, nb);
+        assert!(na.starts_with(&format!("{}/", a.tag)));
+        assert_eq!(na.len(), 16 + 1 + 52);
+        // tampering with the tenant box or the header fails
+        let (ct, _) = seal_all_v2(&a, &header(5), b"hello").unwrap();
+        let mut bad = ct.clone();
+        bad[PREAMBLE_LEN + 1] ^= 1;
+        assert!(open_head_v2(&a, &bad).is_err());
+        let mut bad = ct.clone();
+        bad[PREAMBLE_LEN + TBOX_LEN + 3] ^= 1;
+        assert!(open_head_v2(&a, &bad).is_err());
+    }
+
+    /// Crypto-shredding: with K_t destroyed (a new keyring with the same id but no key) nothing opens,
+    /// even with the master root; KEK rotation keeps old objects readable.
+    #[test]
+    fn v2_shred_and_rotation() {
+        let mut master = MasterV2::generate(None);
+        let mut tks = crate::keys2::TenantKeyring::default();
+        tks.create("t", 1).unwrap();
+        let m1 = std::sync::Arc::new(MasterV2::parse(&master.to_text()).unwrap());
+        let a = m1.tenant_keys(&tks.tenants["t"]).unwrap();
+        let (ct, _) = seal_all_v2(&a, &header(3), b"abc").unwrap();
+        master.rotate();
+        let m2 = std::sync::Arc::new(MasterV2::parse(&master.to_text()).unwrap());
+        let a2 = m2.tenant_keys(&tks.tenants["t"]).unwrap();
+        assert_eq!(a2.write_kid(), 2);
+        assert!(open_head_v2(&a2, &ct).is_ok(), "generation 1 still derivable");
+        let (ct2, i2) = seal_all_v2(&a2, &header(3), b"abc").unwrap();
+        assert_eq!(i2.kid, 2);
+        assert!(open_head_v2(&a, &ct2).is_ok(), "the old copy of the root derives generation 2");
+        // shred: the same id with any other secret opens nothing
+        let mut guess = tks.tenants["t"].clone();
+        tks.erase("t", 2).unwrap();
+        assert!(m2.tenant_keys(&tks.tenants["t"]).is_err());
+        guess.k_t = Some(zeroize::Zeroizing::new([0u8; 32]));
+        let g = m2.tenant_keys(&guess).unwrap();
+        assert!(open_head_v2(&g, &ct).is_err());
+        assert_eq!(open_tenant_box(&m2, &ct).unwrap(), guess.id, "only the opaque id remains");
     }
 }

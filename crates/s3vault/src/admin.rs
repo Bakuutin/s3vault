@@ -15,8 +15,17 @@
 //!                       fraction unless force=1; refused when the fallback lists empty or is retired
 //! GET  /manifest?bucket=B[&after=K][&limit=N]   index rows only (key, size, sha256, etag, mtime, state);
 //!                       never asks the fallback (export manifests and deploy pass checks)
+//! GET  /tenants                         tenants of the configured buckets: status, frozen, tag, counts
+//! POST /tenant/freeze?tenant=N&on=1|0   freeze (403 for its buckets) or unfreeze
+//! POST /tenant/erase?tenant=N&confirm=N after `s3vault-keyd tenant-erase`: drop keys, index, staging;
+//!                                       purge by manifest and prefix; returns the proof record
+//! GET  /tenant/verify-erasure?id=HEX    objects left under the erased tenant's prefix, proofs
+//! POST /object/erase?bucket=B&key=K&confirm=1   erase one object and record it in the outbox
+//! GET  /ledger                          the merged erasure ledger (JSON lines)
+//! GET  /ledger/outbox                   entries from this proxy to import into the key service
+//! POST /ledger/replay[?dry_run=1]       apply the ledger to the stores (after a restore)
 //! POST /snapshot
-//! POST /unlock          (retry the key service now)
+//! POST /unlock          (retry the key service now; when unlocked: re-read tenants and ledger)
 //! ```
 
 use crate::background::{self, Fills};
@@ -103,9 +112,13 @@ pub fn status_json(vault: &Vault, fills: &Fills) -> Value {
     let u = vault.unlocked().ok();
     for n in names {
         let b = &vault.buckets[n];
-        let counts = u.as_ref().and_then(|u| u.index.counts(n).ok());
+        let counts = u
+            .as_ref()
+            .and_then(|u| u.tenant_loaded(&b.tenant))
+            .and_then(|t| t.index.counts(n).ok());
         buckets.push(json!({
             "name": n,
+            "tenant": b.tenant,
             "store": b.store.label,
             "store_bucket": b.store.bucket_name(),
             "fallback": b.fallback.as_ref().map(|f| f.label.clone()),
@@ -116,20 +129,58 @@ pub fn status_json(vault: &Vault, fills: &Fills) -> Value {
         }));
     }
     json!({
+        "format": 2,
         "locked": vault.is_locked(),
         "unlock_error": *vault.last_unlock_error.read().unwrap(),
-        "keyring_fingerprint": u.as_ref().map(|u| u.keyring.fingerprint()),
-        "active_kid": u.as_ref().map(|u| u.keyring.active_kid),
-        "write_kid": u.as_ref().map(|u| u.keyring.write_kid()),
-        "pending_kid": u.as_ref().map(|u| u.keyring.pending_kid),
-        "active_kid_escrowed": u.as_ref().map(|u| u.keyring.is_escrowed(u.keyring.active_kid)),
-        "escrow_places": u.as_ref().map(|u| u.keyring.escrow_places()),
-        "kids": u.as_ref().map(|u| u.keyring.kids()),
+        "keyring_fingerprint": u.as_ref().map(|u| u.master.fingerprint()),
+        "active_kid": u.as_ref().map(|u| u.master.active),
+        "root_escrowed": u.as_ref().map(|u| u.master.is_escrowed()),
+        "escrow_places": u.as_ref().map(|u| u.master.escrow_places()),
+        "ledger_entries": u.as_ref().map(|u| u.ledger.lock().unwrap().entries.len()),
         "started_ms": vault.started_ms,
         "live_fetches": vault.live_fetches.load(Ordering::SeqCst),
+        "tenants": tenants_json(vault),
         "buckets": buckets,
         "fills": fills.statuses(vault),
     })
+}
+
+pub fn tenants_json(vault: &Vault) -> Value {
+    let Ok(u) = vault.unlocked() else {
+        return json!([]);
+    };
+    let mut names: Vec<&String> = vault.buckets.values().map(|b| &b.tenant).collect();
+    names.sort();
+    names.dedup();
+    let out: Vec<Value> = names
+        .into_iter()
+        .map(|n| {
+            let t = u.tenant_loaded(n);
+            json!({
+                "name": n,
+                "status": u.tenant_status(n),
+                "id": t.as_ref().map(|t| t.keys.id_hex()),
+                "tag": t.as_ref().map(|t| t.keys.tag.clone()),
+                "k_t_fingerprint": t.as_ref().map(|t| t.keys.fingerprint.clone()),
+                "frozen": t.as_ref().map(|t| t.frozen.load(Ordering::SeqCst)),
+                "buckets": vault.buckets.values().filter(|b| &b.tenant == n).map(|b| b.name.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!(out)
+}
+
+fn text_reply(body: String) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap())
+}
+
+async fn fetch_bundle_now(vault: &Vault) -> anyhow::Result<s3vault_format::keys2::Bundle> {
+    let cfg = vault.cfg.keys.clone();
+    tokio::task::spawn_blocking(move || background::fetch_bundle(&cfg)).await?
 }
 
 async fn handle(
@@ -246,8 +297,9 @@ async fn handle(
             let limit = num("limit").unwrap_or(1000).clamp(1, 10_000) as usize;
             let rows = match vault
                 .unlocked()
+                .and_then(|u| vault.tenant_of(&u, bucket))
                 .map_err(|e| e.to_string())
-                .and_then(|u| u.index.list(bucket, "", &after, limit).map_err(|e| e.to_string()))
+                .and_then(|(_, t)| t.index.list(bucket, "", &after, limit).map_err(|e| e.to_string()))
             {
                 Ok(r) => r,
                 Err(e) => return reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e})),
@@ -270,11 +322,91 @@ async fn handle(
             ),
         },
         (&Method::POST, "/unlock") => {
-            ctx.wake.notify_one();
-            reply(
-                StatusCode::OK,
-                json!({"locked": vault.is_locked(), "retrying": vault.is_locked()}),
-            )
+            if vault.is_locked() {
+                ctx.wake.notify_one();
+                return reply(StatusCode::OK, json!({"locked": true, "retrying": true}));
+            }
+            match fetch_bundle_now(&vault).await.and_then(|b| vault.refresh(b)) {
+                Ok(()) => reply(StatusCode::OK, json!({"locked": false, "refreshed": true, "tenants": tenants_json(&vault)})),
+                Err(e) => reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": format!("{e:#}")})),
+            }
+        }
+        (&Method::GET, "/tenants") => reply(StatusCode::OK, tenants_json(&vault)),
+        (&Method::POST, "/tenant/freeze") => {
+            let Some(name) = q.get("tenant") else {
+                return reply(StatusCode::BAD_REQUEST, json!({"error": "tenant"}));
+            };
+            let on = q.get("on").map(|v| v != "0").unwrap_or(true);
+            let res = vault
+                .unlocked()
+                .map_err(|e| e.to_string())
+                .and_then(|u| u.tenant_loaded(name).ok_or_else(|| "tenant not loaded".to_string()))
+                .and_then(|t| vault.set_frozen(&t, on).map_err(|e| e.to_string()));
+            match res {
+                Ok(()) => reply(StatusCode::OK, json!({"tenant": name, "frozen": on})),
+                Err(e) => reply(StatusCode::CONFLICT, json!({"error": e})),
+            }
+        }
+        (&Method::POST, "/tenant/erase") => {
+            let Some(name) = q.get("tenant") else {
+                return reply(StatusCode::BAD_REQUEST, json!({"error": "tenant"}));
+            };
+            if q.get("confirm") != Some(name) {
+                return reply(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "pass confirm=<tenant name> to erase"}),
+                );
+            }
+            let res = async {
+                let bundle = fetch_bundle_now(&vault).await?;
+                crate::erasure::erase_tenant(&vault, name, &bundle).await
+            }
+            .await;
+            match res {
+                Ok(p) => reply(StatusCode::OK, p),
+                Err(e) => reply(StatusCode::CONFLICT, json!({"error": format!("{e:#}")})),
+            }
+        }
+        (&Method::GET, "/tenant/verify-erasure") => {
+            let Some(id) = q.get("id") else {
+                return reply(StatusCode::BAD_REQUEST, json!({"error": "id"}));
+            };
+            match crate::erasure::verify_tenant_erasure(&vault, id).await {
+                Ok(v) => reply(StatusCode::OK, v),
+                Err(e) => reply(StatusCode::CONFLICT, json!({"error": format!("{e:#}")})),
+            }
+        }
+        (&Method::POST, "/object/erase") => {
+            let (Some(bucket), Some(key)) = (q.get("bucket"), q.get("key")) else {
+                return reply(StatusCode::BAD_REQUEST, json!({"error": "bucket and key"}));
+            };
+            if q.get("confirm").map(String::as_str) != Some("1") {
+                return reply(StatusCode::BAD_REQUEST, json!({"error": "pass confirm=1"}));
+            }
+            match crate::erasure::erase_object(&vault, bucket, key).await {
+                Ok(e) => reply(StatusCode::OK, json!({"outbox_entry": e})),
+                Err(e) => reply(StatusCode::CONFLICT, json!({"error": e.to_string()})),
+            }
+        }
+        (&Method::GET, "/ledger") => match vault.unlocked() {
+            Ok(u) => text_reply(u.ledger.lock().unwrap().to_text()),
+            Err(e) => reply(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+        },
+        (&Method::GET, "/ledger/outbox") => match crate::erasure::read_outbox(&vault) {
+            Ok(l) => text_reply(l.to_text()),
+            Err(e) => reply(StatusCode::CONFLICT, json!({"error": format!("{e:#}")})),
+        },
+        (&Method::POST, "/ledger/replay") => {
+            let dry = q.get("dry_run").is_some_and(|v| v == "1");
+            let res = async {
+                let entries = crate::erasure::all_entries(&vault)?;
+                crate::erasure::replay_all(&vault, &entries, dry).await
+            }
+            .await;
+            match res {
+                Ok(r) => reply(StatusCode::OK, json!(r)),
+                Err(e) => reply(StatusCode::CONFLICT, json!({"error": format!("{e:#}")})),
+            }
         }
         _ => reply(StatusCode::NOT_FOUND, json!({"error": "not found"})),
     }

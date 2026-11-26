@@ -89,8 +89,15 @@ pub struct KeysCfg {
     pub keyd_addr: Option<String>,
     #[serde(default)]
     pub psk_file: Option<PathBuf>,
+    /// `source = "file"`: the master keyring (v2).
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// `source = "file"`: the tenant keyring.
+    #[serde(default)]
+    pub tenants_file: Option<PathBuf>,
+    /// `source = "file"`: the erasure ledger (JSON lines).
+    #[serde(default)]
+    pub ledger_file: Option<PathBuf>,
     #[serde(default = "default_retry")]
     pub retry_secs: u64,
 }
@@ -136,6 +143,9 @@ pub struct BucketCfg {
     pub name: String,
     /// Key into `[stores]`.
     pub store: String,
+    /// The tenant (in the key service's tenant keyring) whose key encrypts this bucket. Several buckets
+    /// may share a tenant; erasing the tenant shreds all of them.
+    pub tenant: String,
     #[serde(default)]
     pub fallback: Option<FallbackRef>,
 }
@@ -271,6 +281,9 @@ impl Config {
             if !self.stores.contains_key(&b.store) {
                 bail!("bucket {}: unknown store {}", b.name, b.store);
             }
+            if !s3vault_format::keys2::valid_tenant_name(&b.tenant) {
+                bail!("bucket {}: tenant names are 1-64 of [a-z0-9_-]", b.name);
+            }
             if let Some(f) = &b.fallback
                 && !self.fallbacks.contains_key(&f.source)
             {
@@ -317,8 +330,10 @@ impl Config {
         Ok(())
     }
 
-    /// The store that holds index snapshots: the first one by name.
-    pub fn meta_store(&self) -> &str {
-        self.stores.keys().next().expect("validated")
+    /// The store that holds a tenant's index snapshots: the store of its first bucket (by name).
+    pub fn tenant_store(&self, tenant: &str) -> Option<&str> {
+        let mut bs: Vec<&BucketCfg> = self.buckets.iter().filter(|b| b.tenant == tenant).collect();
+        bs.sort_by(|a, b| a.name.cmp(&b.name));
+        bs.first().map(|b| b.store.as_str())
     }
 }

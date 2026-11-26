@@ -118,6 +118,7 @@ fn s3err(e: VaultError) -> S3Error {
         }
         VaultError::NoSuchKey => s3_error!(NoSuchKey),
         VaultError::NoSuchBucket => s3_error!(NoSuchBucket),
+        VaultError::AccessDenied(m) => s3_error!(AccessDenied, "{m}"),
         VaultError::NoSuchUpload => s3_error!(NoSuchUpload),
         VaultError::PreconditionFailed => s3_error!(PreconditionFailed),
         VaultError::InvalidPart(m) => s3_error!(InvalidPart, "{m}"),

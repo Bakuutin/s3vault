@@ -10,6 +10,8 @@
 
 pub mod keyproto;
 pub mod keyring;
+pub mod keys2;
+pub mod ledger;
 pub mod object;
 pub mod spool;
 

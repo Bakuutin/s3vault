@@ -9,7 +9,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3vault::config::Config;
 use s3vault::index::{Index, LIVE, TOMBSTONE};
-use s3vault_format::keyring::Keyring;
+use s3vault_format::keys2::{Bundle, MasterV2, TenantKeyring};
+use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -131,11 +132,13 @@ read_timeout_secs = 5
 [[buckets]]
 name = "data"
 store = "main"
+tenant = "t1"
 fallback = {{ source = "legacy", bucket = "legacy" }}
 
 [[buckets]]
 name = "plain"
 store = "main"
+tenant = "t2"
 
 [[clients]]
 name = "app"
@@ -157,6 +160,34 @@ yield_ms = 20
         data = dir.join("data").display(),
         dir = dir.display(),
     )
+}
+
+/// An escrowed master keyring and a tenant keyring with these tenants active (texts).
+fn test_keys(tenants: &[&str]) -> (String, String) {
+    let mut m = MasterV2::generate(None);
+    m.confirm_escrow(&m.escrow_digest(), "test", 1).unwrap();
+    let mut tk = TenantKeyring::default();
+    for t in tenants {
+        tk.create(t, 1).unwrap();
+    }
+    let copy = tk.clone();
+    tk.confirm_escrow(&copy, "d", "test", 1).unwrap();
+    (m.to_text().to_string(), tk.to_text().to_string())
+}
+
+/// The index partition of a bucket's tenant.
+fn tidx(v: &s3vault::vault::Vault, bucket: &str) -> Arc<Index> {
+    let u = v.unlocked().unwrap();
+    u.tenant_loaded(&v.buckets[bucket].tenant).unwrap().index.clone()
+}
+
+fn tenant_rt(v: &s3vault::vault::Vault, bucket: &str) -> Arc<s3vault::vault::TenantRt> {
+    let u = v.unlocked().unwrap();
+    u.tenant_loaded(&v.buckets[bucket].tenant).unwrap()
+}
+
+fn bundle(env: &Env) -> Bundle {
+    s3vault::background::fetch_bundle(&env.cfg.keys).unwrap()
 }
 
 async fn wait_unlocked(r: &s3vault::Running) {
@@ -182,8 +213,15 @@ async fn setup() -> Env {
     write(&dir.join("reader.secret"), "reader-secret\n");
     write(&dir.join("admin.token"), &format!("{ADMIN_TOKEN}\n"));
     let keyring_path = dir.join("keyring");
-    write(&keyring_path, &Keyring::generate().to_text());
-    let keys = format!("source = \"file\"\nfile = \"{}\"", keyring_path.display());
+    let (master, tenants) = test_keys(&["t1", "t2"]);
+    write(&keyring_path, &master);
+    write(&dir.join("tenants"), &tenants);
+    write(&dir.join("ledger.jsonl"), "");
+    let keys = format!(
+        "source = \"file\"\nfile = \"{}\"\ntenants_file = \"{d}/tenants\"\nledger_file = \"{d}/ledger.jsonl\"",
+        keyring_path.display(),
+        d = dir.display()
+    );
     let cfg: Config = toml::from_str(&config_text(&dir, store.addr, fallback.addr, &keys)).unwrap();
     cfg.validate().unwrap();
     client(&format!("http://{}", store.addr), AK, SK)
@@ -658,10 +696,7 @@ async fn core_s3_needs_and_ciphertext_only() {
         404
     );
     assert!(
-        std::fs::read_dir(env.dir.join("data/staging"))
-            .unwrap()
-            .next()
-            .is_none(),
+        all_files(&env.dir.join("data/staging")).is_empty(),
         "staging cleaned up"
     );
     // The store holds only ciphertext: flat keyed-hash names, no key names, no plaintext runs.
@@ -734,18 +769,11 @@ async fn core_s3_needs_and_ciphertext_only() {
         403
     );
     // tampering with a stored object is detected (500, never wrong data)
-    let row = env
-        .vault()
-        .unlocked()
-        .unwrap()
-        .index
-        .get("plain", "once")
-        .unwrap()
-        .unwrap();
-    let u = env.vault().unlocked().unwrap();
+    let row = tidx(env.vault(), "plain").get("plain", "once").unwrap().unwrap();
+    let t = tenant_rt(env.vault(), "plain");
     let name = env
         .vault()
-        .store_name(&u, &env.vault().buckets["plain"].store, "plain", "once");
+        .store_name(&t, &env.vault().buckets["plain"].store, "plain", "once");
     let path = env.store.root.join("cipher").join(&name);
     let mut raw = std::fs::read(&path).unwrap();
     let last = raw.len() - 1;
@@ -802,7 +830,7 @@ async fn read_through_write_back_tombstones_and_503() {
         .await
         .unwrap();
     assert_eq!(h.content_length(), Some(old.len() as i64));
-    let idx = env.vault().unlocked().unwrap().index.clone();
+    let idx = tidx(env.vault(), "data");
     assert!(idx.get("data", "rec/a.opus").unwrap().is_none());
     // Merged listing: fallback keys appear
     let l = c.list_objects_v2().bucket("data").send().await.unwrap();
@@ -981,11 +1009,12 @@ async fn read_through_write_back_tombstones_and_503() {
 
     // Rebuild from the store plus the keyring alone, into a fresh index; compare with the live one.
     env.fallback = start_fs_s3(&env.dir.join("fallback"), Some(env.fallback.addr)).await;
-    let kr = Keyring::parse(&std::fs::read_to_string(&env.keyring_path).unwrap()).unwrap();
-    let fresh = Index::open(&env.dir.join("rebuilt.db"), Some(&kr.index_db_key())).unwrap();
+    let t1 = tenant_rt(env.vault(), "data");
+    let t2 = tenant_rt(env.vault(), "plain");
+    let fresh = Index::open(&env.dir.join("rebuilt.db"), Some(&t1.keys.index_key)).unwrap();
     let rep = s3vault::background::rebuild(
         env.running.as_ref().unwrap().vault.clone(),
-        &kr,
+        &t1.keys,
         &fresh,
         false,
         4,
@@ -993,25 +1022,42 @@ async fn read_through_write_back_tombstones_and_503() {
     .await
     .unwrap();
     assert_eq!(rep.errors, 0);
+    let fresh2 = Index::open(&env.dir.join("rebuilt2.db"), Some(&t2.keys.index_key)).unwrap();
+    let rep_b = s3vault::background::rebuild(
+        env.running.as_ref().unwrap().vault.clone(),
+        &t2.keys,
+        &fresh2,
+        false,
+        4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep_b.errors, 0);
     for (b, k) in [
         ("data", "rec/a.opus"),
         ("data", "rec/b.opus"),
         ("data", "new/x"),
         ("plain", "p"),
     ] {
-        let mut a = idx.get(b, k).unwrap().unwrap();
-        let mut r = fresh.get(b, k).unwrap().unwrap();
+        let mut a = tidx(env.vault(), b).get(b, k).unwrap().unwrap();
+        let mut r = if b == "data" { &fresh } else { &fresh2 }.get(b, k).unwrap().unwrap();
         a.origin = 0;
         r.origin = 0;
         assert_eq!(a, r, "{b}/{k}");
     }
     assert_eq!(fresh.counts("data").unwrap(), idx.counts("data").unwrap());
-    // with the wrong keyring nothing is readable
-    let other = Keyring::generate();
-    let other_idx = Index::open(&env.dir.join("other.db"), Some(&other.index_db_key())).unwrap();
+    assert_eq!(fresh.counts("plain").unwrap(), (0, 0, 0), "a tenant rebuild sees only its own objects");
+    // With another tenant secret (same id, same prefix) nothing is readable.
+    let mut b = bundle(&env);
+    let mut e = b.tenants.tenants["t1"].clone();
+    e.k_t = Some(zeroize::Zeroizing::new([9u8; 32]));
+    b.tenants.tenants.insert("t1".into(), e.clone());
+    let m = Arc::new(b.master);
+    let wrong = m.tenant_keys(&e).unwrap();
+    let other_idx = Index::open(&env.dir.join("other.db"), Some(&wrong.index_key)).unwrap();
     let rep2 = s3vault::background::rebuild(
         env.running.as_ref().unwrap().vault.clone(),
-        &other,
+        &wrong,
         &other_idx,
         false,
         4,
@@ -1023,17 +1069,19 @@ async fn read_through_write_back_tombstones_and_503() {
     // snapshot + incremental rebuild
     let snap = s3vault::background::snapshot(env.vault()).await.unwrap();
     assert!(snap.rows >= 4);
-    let inc = Index::open(&env.dir.join("inc.db"), Some(&kr.index_db_key())).unwrap();
+    assert_eq!(snap.tenants, 2);
+    let inc = Index::open(&env.dir.join("inc.db"), Some(&t1.keys.index_key)).unwrap();
     let rep3 = s3vault::background::rebuild(
         env.running.as_ref().unwrap().vault.clone(),
-        &kr,
+        &t1.keys,
         &inc,
         true,
         4,
     )
     .await
     .unwrap();
-    assert!(rep3.snapshot_rows >= 4);
+    assert!(rep3.snapshot_rows >= 3, "{rep3:?}");
+    assert_eq!(rep3.snapshot_rows, idx.counts("data").unwrap().0 + idx.counts("data").unwrap().1);
     assert_eq!(inc.counts("data").unwrap(), idx.counts("data").unwrap());
     env.running.take().unwrap().shutdown().await;
 }
@@ -1076,7 +1124,7 @@ async fn background_fill_and_verify() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let idx = env.vault().unlocked().unwrap().index.clone();
+    let idx = tidx(env.vault(), "data");
     let st = admin_get(&env, "/fill").await;
     assert_eq!(
         st[0]["session_copied"].as_u64().unwrap() + st[0]["session_skipped"].as_u64().unwrap(),
@@ -1246,7 +1294,8 @@ async fn locked_without_key_service_returns_503() {
     );
 
     // Now the key service comes up on that address with the right PSK: the vault unlocks by itself.
-    let kr_text = Keyring::generate().to_text();
+    let (m, t) = test_keys(&["t1", "t2"]);
+    let kr_text = format!("%master\n{m}%tenants\n{t}%ledger\n");
     let psk =
         s3vault_format::keyproto::parse_psk(&std::fs::read_to_string(dir.join("psk")).unwrap())
             .unwrap();
@@ -1366,7 +1415,7 @@ async fn reconcile_refuses_empty_unreachable_or_retired_fallback() {
     }
     admin_post(&env, "/fill/start?bucket=data").await;
     wait_fill_idle(&env).await;
-    let idx = env.vault().unlocked().unwrap().index.clone();
+    let idx = tidx(env.vault(), "data");
     assert_eq!(idx.counts("data").unwrap().0, 6);
 
     // Empty fallback (retired, re-created or the wrong bucket): refused, nothing removed.
@@ -1417,8 +1466,7 @@ async fn reconcile_refuses_empty_unreachable_or_retired_fallback() {
     cfg.server.admin_listen = None;
     cfg.server.data_dir = env.dir.join("retired-data");
     let v = s3vault::vault::Vault::new(cfg).unwrap();
-    v.unlock(Keyring::parse(&std::fs::read_to_string(&env.keyring_path).unwrap()).unwrap())
-        .unwrap();
+    v.unlock(bundle(&env)).unwrap();
     let e = s3vault::background::reconcile(
         v.clone(),
         "data",
@@ -1435,36 +1483,47 @@ async fn reconcile_refuses_empty_unreachable_or_retired_fallback() {
     env.running.take().unwrap().shutdown().await;
 }
 
-/// H2: a rotated key that is not escrowed is never used for writes, even if a keyring marks it active.
+/// H2 in format v2: an unescrowed master root is refused; KEK rotation is deterministic, so it needs no
+/// new escrow, writes under the new generation and keeps old objects readable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotation_escrow_gate_in_proxy() {
     let env = setup().await;
-    let mut kr = Keyring::parse(&std::fs::read_to_string(&env.keyring_path).unwrap()).unwrap();
-    let fp = kr.fingerprint();
-    kr.rotate().unwrap();
-    // a hand edit that activates the pending key without an escrow record
-    let text = kr.to_text().replace("active 1", "active 2").replace("pending 2\n", "");
-    let open = |text: &str, sub: &str| {
+    let open = |master: &str, sub: &str| {
         let mut cfg = env.cfg.clone();
         cfg.server.listen = vec![];
         cfg.server.admin_listen = None;
         cfg.server.data_dir = env.dir.join(sub);
         let v = s3vault::vault::Vault::new(cfg).unwrap();
-        v.unlock(Keyring::parse(text).unwrap()).unwrap();
-        v
+        let mut b = bundle(&env);
+        b.master = MasterV2::parse(master).unwrap();
+        (v.clone(), v.unlock(b))
     };
-    let v = open(&text, "gate-a");
-    let put = |v: std::sync::Arc<s3vault::vault::Vault>, key: &'static str| async move {
+    let text = std::fs::read_to_string(&env.keyring_path).unwrap();
+    let unescrowed: String = text
+        .lines()
+        .filter(|l| !l.starts_with("escrow "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let (_, r) = open(&unescrowed, "gate-a");
+    assert!(r.unwrap_err().to_string().contains("escrow"), "unescrowed root refused");
+    let put = |v: Arc<s3vault::vault::Vault>, key: &'static str| async move {
         let body: s3vault::remote::ByteStream =
             Box::pin(futures::stream::once(async { Ok(bytes::Bytes::from_static(b"x")) }));
         v.put("plain", key, body, Default::default()).await.unwrap();
-        v.unlocked().unwrap().index.get("plain", key).unwrap().unwrap().kid
+        tidx(&v, "plain").get("plain", key).unwrap().unwrap().kid
     };
-    assert_eq!(put(v.clone(), "before-escrow").await, 1, "unescrowed key 2 not used");
-    // After the escrow is confirmed with the copy's digest, key 2 is used; the fingerprint is unchanged.
-    kr.confirm_escrow(&kr.escrow_digest(), "owner-mac", 1).unwrap();
-    let v2 = open(&kr.to_text(), "gate-b");
-    assert_eq!(put(v2.clone(), "after-escrow").await, 2);
-    assert_eq!(v2.unlocked().unwrap().keyring.fingerprint(), fp);
+    let (v1, r) = open(&text, "gate-b");
+    r.unwrap();
+    assert_eq!(put(v1.clone(), "gen1").await, 1);
+    let fp = v1.unlocked().unwrap().master.fingerprint();
+    drop(v1);
+    let mut m = MasterV2::parse(&text).unwrap();
+    assert_eq!(m.rotate(), 2);
+    assert!(m.is_escrowed(), "rotation keeps the escrow valid");
+    let (v2, r) = open(&m.to_text(), "gate-b");
+    r.unwrap();
+    assert_eq!(v2.unlocked().unwrap().master.fingerprint(), fp);
+    assert_eq!(put(v2.clone(), "gen2").await, 2);
+    assert_eq!(s3vault::background::read_all(&v2, "plain", "gen1").await.unwrap(), b"x");
     env.running.unwrap().shutdown().await;
 }

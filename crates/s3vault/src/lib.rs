@@ -8,7 +8,9 @@
 pub mod admin;
 pub mod background;
 pub mod config;
+pub mod erasure;
 pub mod index;
+pub mod migrate;
 pub mod remote;
 pub mod s3;
 pub mod server;

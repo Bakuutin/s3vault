@@ -11,15 +11,17 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use md5::{Digest as _, Md5};
 use rand::RngCore;
-use s3vault_format::keyring::{Key32, Keyring};
+use s3vault_format::keyring::Key32;
+use s3vault_format::keys2::{Bundle, MasterV2, TenantKeyring, TenantKeys, TenantStatus};
+use s3vault_format::ledger::Ledger;
 use s3vault_format::object::{self, Header, Layout};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Buffer and authenticate ranged reads up to this size before answering, so an integrity failure becomes
 /// a clean 500 instead of a truncated body.
@@ -50,6 +52,8 @@ pub enum VaultError {
     InvalidRequest(String),
     #[error("integrity failure: {0}")]
     Integrity(String),
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -88,13 +92,85 @@ pub struct BucketRt {
     pub fallback: Option<Arc<Remote>>,
     /// Fill and reconcile refuse to run against a retired fallback.
     pub fallback_retired: bool,
+    /// The tenant whose key encrypts this bucket.
+    pub tenant: String,
+}
+
+/// One tenant in the proxy's RAM: its keys and its index partition (`data_dir/tenants/<id>.db`).
+pub struct TenantRt {
+    pub keys: TenantKeys,
+    pub index: Arc<Index>,
+    /// A frozen tenant's buckets answer 403 (erasure step 2, restriction of processing).
+    pub frozen: AtomicBool,
 }
 
 pub struct Unlocked {
-    pub keyring: Keyring,
-    pub name_key: Key32,
+    pub master: Arc<MasterV2>,
+    /// The small system database: fingerprint, frozen flags.
+    pub sys: Arc<Index>,
+    /// Temporary spools only (random per process start).
     pub spool_key: Key32,
-    pub index: Arc<Index>,
+    tenants: RwLock<HashMap<String, Arc<TenantRt>>>,
+    /// Key-service status of every configured tenant: pending, active, erased, missing.
+    status: RwLock<HashMap<String, String>>,
+    /// The erasure ledger (merged from the key service and the local copy).
+    pub ledger: Mutex<Ledger>,
+}
+
+impl Unlocked {
+    /// The tenant if it is active (served).
+    pub fn tenant(&self, name: &str) -> VResult<Arc<TenantRt>> {
+        let st = self.tenant_status(name);
+        match st.as_str() {
+            "active" => {}
+            "erased" => return Err(VaultError::AccessDenied("tenant erased".into())),
+            "pending" => {
+                return Err(VaultError::Unavailable(
+                    "tenant pending its escrow confirmation".into(),
+                ));
+            }
+            _ => {
+                return Err(VaultError::Unavailable(
+                    "tenant not served by the key service".into(),
+                ));
+            }
+        }
+        self.tenants
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| VaultError::Unavailable("tenant not loaded".into()))
+    }
+
+    /// A loaded tenant regardless of its status (admin operations).
+    pub fn tenant_loaded(&self, name: &str) -> Option<Arc<TenantRt>> {
+        self.tenants.read().unwrap().get(name).cloned()
+    }
+
+    pub fn tenant_status(&self, name: &str) -> String {
+        self.status
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "missing".into())
+    }
+
+    pub fn loaded_tenants(&self) -> Vec<Arc<TenantRt>> {
+        let mut v: Vec<_> = self.tenants.read().unwrap().values().cloned().collect();
+        v.sort_by(|a, b| a.keys.name.cmp(&b.keys.name));
+        v
+    }
+
+    /// Remove a tenant from RAM (its keys are zeroized when the last reference goes).
+    pub fn drop_tenant(&self, name: &str) -> Option<Arc<TenantRt>> {
+        self.status
+            .write()
+            .unwrap()
+            .insert(name.to_string(), "erased".into());
+        self.tenants.write().unwrap().remove(name)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -239,6 +315,7 @@ impl Vault {
                     store: stores[&b.store].clone(),
                     fallback,
                     fallback_retired: b.fallback.as_ref().is_some_and(|f| f.retired),
+                    tenant: b.tenant.clone(),
                 }),
             );
         }
@@ -268,26 +345,168 @@ impl Vault {
         }))
     }
 
-    /// Install the keyring: opens (or creates) the encrypted index and checks it belongs to this keyring.
-    pub fn unlock(&self, keyring: Keyring) -> anyhow::Result<()> {
-        let path = self.cfg.server.data_dir.join("index.db");
-        let index = Index::open(&path, Some(&keyring.index_db_key()))
-            .context("open the index with this keyring (a different keyring cannot read it)")?;
-        let fp = keyring.fingerprint();
-        match index.meta_get("keyring_fingerprint")? {
-            Some(old) if old != fp => anyhow::bail!("index belongs to keyring {old}, got {fp}"),
-            Some(_) => {}
-            None => index.meta_set("keyring_fingerprint", &fp)?,
+    pub fn tenants_dir(&self) -> PathBuf {
+        self.cfg.server.data_dir.join("tenants")
+    }
+
+    pub fn tenant_index_path(&self, id_hex: &str) -> PathBuf {
+        self.tenants_dir().join(format!("{id_hex}.db"))
+    }
+
+    pub fn tenant_staging(&self, t: &TenantRt) -> PathBuf {
+        self.staging_dir.join(t.keys.id_hex())
+    }
+
+    pub fn ledger_path(&self) -> PathBuf {
+        self.cfg.server.data_dir.join("ledger.jsonl")
+    }
+
+    /// Merge a ledger received from the key service into the local copy (which survives a key-service
+    /// restore from an old backup). Diverging copies are refused.
+    fn merge_ledger(&self, local: &mut Ledger, received: &Ledger) -> anyhow::Result<()> {
+        if local.merge(received)? {
+            let tmp = self.ledger_path().with_extension("jsonl.new");
+            std::fs::write(&tmp, local.to_text())?;
+            std::fs::rename(&tmp, self.ledger_path())?;
+        } else if received.entries.len() < local.entries.len() {
+            warn!(
+                local = local.entries.len(),
+                received = received.entries.len(),
+                "the key service's erasure ledger is behind the local copy (restored from a backup?); keeping the local one"
+            );
         }
-        let u = Unlocked {
-            name_key: keyring.name_key(),
-            spool_key: keyring.spool_key(),
-            keyring,
-            index: Arc::new(index),
+        Ok(())
+    }
+
+    /// Install the keys: opens the system database and the index partition of every active configured
+    /// tenant, after checking the master root is escrowed and merging the erasure ledger.
+    pub fn unlock(&self, bundle: Bundle) -> anyhow::Result<()> {
+        let master = Arc::new(bundle.master);
+        if !master.is_escrowed() {
+            anyhow::bail!(
+                "the master root has no confirmed escrow copy: refusing to use it (s3vault-keyd escrow-confirm)"
+            );
+        }
+        let fp = master.fingerprint();
+        std::fs::create_dir_all(self.tenants_dir())?;
+        let sys = Index::open(
+            &self.cfg.server.data_dir.join("system.db"),
+            Some(&master.system_db_key()),
+        )
+        .context("open the system database with this keyring (a different keyring cannot read it)")?;
+        match sys.meta_get("keyring_fingerprint")? {
+            Some(old) if old != fp => anyhow::bail!("data dir belongs to keyring {old}, got {fp}"),
+            Some(_) => {}
+            None => sys.meta_set("keyring_fingerprint", &fp)?,
+        }
+        let mut ledger = match std::fs::read_to_string(self.ledger_path()) {
+            Ok(t) => Ledger::parse(&t).context("local erasure ledger")?,
+            Err(_) => Ledger::default(),
         };
+        self.merge_ledger(&mut ledger, &bundle.ledger)?;
+        let mut spool_key = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *spool_key);
+        let u = Unlocked {
+            master,
+            sys: Arc::new(sys),
+            spool_key,
+            tenants: RwLock::new(HashMap::new()),
+            status: RwLock::new(HashMap::new()),
+            ledger: Mutex::new(ledger),
+        };
+        self.load_tenants(&u, &bundle.tenants)?;
         *self.state.write().unwrap() = Some(Arc::new(u));
         info!(fingerprint = %fp, "vault unlocked");
         Ok(())
+    }
+
+    /// Re-read the tenant keyring and the ledger from a fresh bundle (new tenants become served once
+    /// active; tenants erased at the key service stop being served).
+    pub fn refresh(&self, bundle: Bundle) -> anyhow::Result<()> {
+        let u = self.unlocked().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if bundle.master.fingerprint() != u.master.fingerprint() {
+            anyhow::bail!("the key service now serves a different master keyring; restart to switch");
+        }
+        {
+            let mut l = u.ledger.lock().unwrap();
+            self.merge_ledger(&mut l, &bundle.ledger)?;
+        }
+        self.load_tenants(&u, &bundle.tenants)
+    }
+
+    fn load_tenants(&self, u: &Unlocked, tk: &TenantKeyring) -> anyhow::Result<()> {
+        let erased = u.ledger.lock().unwrap().erased_tenants();
+        let mut names: Vec<&String> = self.buckets.values().map(|b| &b.tenant).collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            let status = match tk.tenants.get(name) {
+                None => "missing",
+                Some(e) if e.status == TenantStatus::Erased => "erased",
+                Some(e) if erased.contains(&e.id_hex()) => {
+                    error!(tenant = %name, "the key service serves a tenant the erasure ledger lists as erased (restored from an old backup?): refusing it");
+                    "erased"
+                }
+                Some(e) if e.status == TenantStatus::Pending => "pending",
+                Some(e) => {
+                    let loaded = u.tenants.read().unwrap().get(name).map(|t| t.keys.id);
+                    match loaded {
+                        Some(id) if id == e.id => {}
+                        Some(_) => anyhow::bail!("tenant {name} changed its id; restart to switch"),
+                        None => {
+                            let keys = u.master.tenant_keys(e)?;
+                            let idx = Index::open(
+                                &self.tenant_index_path(&keys.id_hex()),
+                                Some(&keys.index_key),
+                            )
+                            .with_context(|| format!("open the index of tenant {name}"))?;
+                            match idx.meta_get("tenant_id")? {
+                                Some(id) if id != keys.id_hex() => {
+                                    anyhow::bail!("index of tenant {name} belongs to another tenant")
+                                }
+                                Some(_) => {}
+                                None => idx.meta_set("tenant_id", &keys.id_hex())?,
+                            }
+                            let frozen = u.sys.meta_get(&format!("frozen:{}", keys.id_hex()))?
+                                == Some("1".into());
+                            u.tenants.write().unwrap().insert(
+                                name.clone(),
+                                Arc::new(TenantRt {
+                                    keys,
+                                    index: Arc::new(idx),
+                                    frozen: AtomicBool::new(frozen),
+                                }),
+                            );
+                        }
+                    }
+                    "active"
+                }
+            };
+            u.status
+                .write()
+                .unwrap()
+                .insert(name.clone(), status.to_string());
+        }
+        Ok(())
+    }
+
+    /// Freeze or unfreeze a tenant (persisted in the system database).
+    pub fn set_frozen(&self, t: &TenantRt, frozen: bool) -> VResult<()> {
+        let u = self.unlocked()?;
+        u.sys
+            .meta_set(&format!("frozen:{}", t.keys.id_hex()), if frozen { "1" } else { "0" })?;
+        t.frozen.store(frozen, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The bucket and its tenant, for a client request.
+    pub fn tenant_of(&self, u: &Unlocked, bucket: &str) -> VResult<(Arc<BucketRt>, Arc<TenantRt>)> {
+        let b = self.bucket(bucket)?;
+        let t = u.tenant(&b.tenant)?;
+        if t.frozen.load(Ordering::SeqCst) {
+            return Err(VaultError::AccessDenied("tenant frozen".into()));
+        }
+        Ok((b, t))
     }
 
     pub fn unlocked(&self) -> VResult<Arc<Unlocked>> {
@@ -314,11 +533,11 @@ impl Vault {
             .await
     }
 
-    pub fn store_name(&self, u: &Unlocked, store: &Remote, bucket: &str, key: &str) -> String {
+    pub fn store_name(&self, t: &TenantRt, store: &Remote, bucket: &str, key: &str) -> String {
         format!(
             "{}{}",
             store.prefix,
-            object::store_name(&u.name_key, bucket, key)
+            object::store_name_v2(&t.keys, bucket, key)
         )
     }
 
@@ -332,9 +551,9 @@ impl Vault {
 
     /// Encrypt `body` (exactly `info.size` bytes) and write it to the store; record it in the index.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn write_object(
+    pub async fn write_object(
         &self,
-        u: &Unlocked,
+        t: &TenantRt,
         store: &Remote,
         bucket: &str,
         key: &str,
@@ -346,7 +565,7 @@ impl Vault {
         origin: i64,
     ) -> VResult<ObjRow> {
         let header = Header {
-            v: 1,
+            v: 2,
             bucket: bucket.to_string(),
             key: key.to_string(),
             size: info.size,
@@ -358,15 +577,15 @@ impl Vault {
             mtime_ms: info.mtime_ms,
             tombstone,
         };
-        let head =
-            object::seal_head(&u.keyring, &header).map_err(|e| VaultError::Internal(e.into()))?;
+        let head = object::seal_head_v2_new(&t.keys, &header)
+            .map_err(|e| VaultError::Internal(e.into()))?;
         let layout = Layout {
             header_sealed_len: head.info.header_sealed_len as u64,
             size: info.size,
         };
         let seal = head.info.clone();
         let ct = encrypt_stream(head.prefix, head.body, layout, body);
-        let name = self.store_name(u, store, bucket, key);
+        let name = self.store_name(t, store, bucket, key);
         self.upload(store, &name, ct, layout.total_len()).await?;
         let row = ObjRow {
             bucket: bucket.to_string(),
@@ -385,7 +604,7 @@ impl Vault {
             mtime_ms: info.mtime_ms,
             origin,
         };
-        u.index.upsert(&row)?;
+        t.index.upsert(&row)?;
         Ok(row)
     }
 
@@ -452,8 +671,8 @@ impl Vault {
 
     pub async fn head(&self, bucket: &str, key: &str) -> VResult<ObjInfo> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
-        match u.index.get(bucket, key)? {
+        let (b, t) = self.tenant_of(&u, bucket)?;
+        match t.index.get(bucket, key)? {
             Some(r) if r.state == TOMBSTONE => Err(VaultError::NoSuchKey),
             Some(r) => Ok(ObjInfo::from_row(&r)),
             None => match &b.fallback {
@@ -480,15 +699,15 @@ impl Vault {
         range: Option<s3s::dto::Range>,
     ) -> VResult<GetResult> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
-        let row = match u.index.get(bucket, key)? {
+        let (b, t) = self.tenant_of(&u, bucket)?;
+        let row = match t.index.get(bucket, key)? {
             Some(r) if r.state == TOMBSTONE => return Err(VaultError::NoSuchKey),
             Some(r) => r,
             None => {
                 if b.fallback.is_none() {
                     return Err(VaultError::NoSuchKey);
                 }
-                match self.fill_one(&u, &b, key, true).await? {
+                match self.fill_one(&u, &t, &b, key, true).await? {
                     FillOutcome::Present(r) => r,
                     FillOutcome::Tombstoned => return Err(VaultError::NoSuchKey),
                     FillOutcome::Fetched { spool, info, .. } => {
@@ -514,12 +733,12 @@ impl Vault {
                 }
             }
         };
-        self.read_stored(&u, &b, &row, range).await
+        self.read_stored(&t, &b, &row, range).await
     }
 
     async fn read_stored(
         &self,
-        u: &Unlocked,
+        t: &TenantRt,
         b: &BucketRt,
         row: &ObjRow,
         range: Option<s3s::dto::Range>,
@@ -546,9 +765,8 @@ impl Vault {
             header_sealed_len: row.hlen,
             ad: row.ad,
         };
-        let cipher = object::body_cipher(&u.keyring, &seal)
-            .map_err(|e| VaultError::Integrity(e.to_string()))?;
-        let name = self.store_name(u, &b.store, &row.bucket, &row.key);
+        let cipher = object::body_cipher_v2(&t.keys, &seal);
+        let name = self.store_name(t, &b.store, &row.bucket, &row.key);
         let (_, ct) = b
             .store
             .get_stream(&name, Some(span))
@@ -587,13 +805,14 @@ impl Vault {
     pub async fn fill_one(
         &self,
         u: &Unlocked,
+        t: &TenantRt,
         b: &BucketRt,
         key: &str,
         live: bool,
     ) -> VResult<FillOutcome> {
         let fb = b.fallback.as_ref().ok_or(VaultError::NoSuchKey)?;
         let _g = self.lock_key(&b.name, key).await;
-        if let Some(r) = u.index.get(&b.name, key)? {
+        if let Some(r) = t.index.get(&b.name, key)? {
             return Ok(if r.state == TOMBSTONE {
                 FillOutcome::Tombstoned
             } else {
@@ -633,7 +852,7 @@ impl Vault {
         };
         let res = self
             .write_object(
-                u,
+                t,
                 &b.store,
                 &b.name,
                 key,
@@ -695,7 +914,7 @@ impl Vault {
         o: PutOpts,
     ) -> VResult<ObjInfo> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
+        let (b, t) = self.tenant_of(&u, bucket)?;
         validate_key(key)?;
         let spool = spool_stream(body, self.new_spool(&u))
             .await
@@ -713,7 +932,7 @@ impl Vault {
             mtime_ms: now_ms(),
         };
         let _g = self.lock_key(bucket, key).await;
-        let existing = u.index.get(bucket, key)?;
+        let existing = t.index.get(bucket, key)?;
         if o.create_only || o.if_match.is_some() {
             let cur = self.current_etag(&b, key, existing.as_ref()).await?;
             if o.create_only && cur.is_some() {
@@ -731,7 +950,7 @@ impl Vault {
         }
         let generation = next_generation(existing.map(|r| r.generation));
         self.write_object(
-            &u,
+            &t,
             &b.store,
             bucket,
             key,
@@ -748,9 +967,9 @@ impl Vault {
 
     pub async fn delete(&self, bucket: &str, key: &str) -> VResult<()> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
+        let (b, t) = self.tenant_of(&u, bucket)?;
         let _g = self.lock_key(bucket, key).await;
-        let existing = u.index.get(bucket, key)?;
+        let existing = t.index.get(bucket, key)?;
         if b.fallback.is_some() {
             // A tombstone object in the store (and the index): the fallback can never bring the key back,
             // and a rebuild from the store alone keeps it deleted.
@@ -767,7 +986,7 @@ impl Vault {
             };
             let generation = next_generation(existing.map(|r| r.generation));
             self.write_object(
-                &u,
+                &t,
                 &b.store,
                 bucket,
                 key,
@@ -783,12 +1002,12 @@ impl Vault {
             if existing.is_none() {
                 return Ok(());
             }
-            let name = self.store_name(&u, &b.store, bucket, key);
+            let name = self.store_name(&t, &b.store, bucket, key);
             b.store
                 .delete(&name)
                 .await
                 .map_err(|e| map_store(&b.store.label, e))?;
-            u.index.remove(bucket, key)?;
+            t.index.remove(bucket, key)?;
         }
         Ok(())
     }
@@ -802,7 +1021,7 @@ impl Vault {
         replace: Option<(Option<String>, BTreeMap<String, String>)>,
     ) -> VResult<ObjInfo> {
         let u = self.unlocked()?;
-        let b = self.bucket(dst_bucket)?;
+        let (b, t) = self.tenant_of(&u, dst_bucket)?;
         validate_key(dst_key)?;
         let src = self.get(src_bucket, src_key, None).await?;
         let spool = spool_stream(src.body, self.new_spool(&u))
@@ -823,10 +1042,10 @@ impl Vault {
             mtime_ms: now_ms(),
         };
         let _g = self.lock_key(dst_bucket, dst_key).await;
-        let existing = u.index.get(dst_bucket, dst_key)?;
+        let existing = t.index.get(dst_bucket, dst_key)?;
         let generation = next_generation(existing.map(|r| r.generation));
         self.write_object(
-            &u,
+            &t,
             &b.store,
             dst_bucket,
             dst_key,
@@ -844,19 +1063,19 @@ impl Vault {
     /// Remove a row and its stored object if the row is still exactly `r` (reconcile of stale filled copies).
     pub async fn remove_if_unchanged(
         &self,
-        u: &Unlocked,
+        t: &TenantRt,
         b: &BucketRt,
         r: &ObjRow,
     ) -> VResult<bool> {
         let _g = self.lock_key(&b.name, &r.key).await;
-        match u.index.get(&b.name, &r.key)? {
+        match t.index.get(&b.name, &r.key)? {
             Some(cur) if cur.generation == r.generation && cur.origin == r.origin => {
-                let name = self.store_name(u, &b.store, &b.name, &r.key);
+                let name = self.store_name(t, &b.store, &b.name, &r.key);
                 b.store
                     .delete(&name)
                     .await
                     .map_err(|e| map_store(&b.store.label, e))?;
-                u.index.remove(&b.name, &r.key)?;
+                t.index.remove(&b.name, &r.key)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -874,8 +1093,8 @@ impl Vault {
         max_keys: usize,
     ) -> VResult<ListResult> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
-        let mut m = Merge::new(&u.index, &b, prefix, after);
+        let (b, t) = self.tenant_of(&u, bucket)?;
+        let mut m = Merge::new(&t.index, &b, prefix, after);
         let mut out = ListResult::default();
         let delimiter = delimiter.filter(|d| !d.is_empty());
         let mut count = 0;
@@ -915,12 +1134,12 @@ impl Vault {
         meta: BTreeMap<String, String>,
     ) -> VResult<String> {
         let u = self.unlocked()?;
-        self.bucket(bucket)?;
+        let (_, t) = self.tenant_of(&u, bucket)?;
         validate_key(key)?;
         let mut id = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut id);
         let upload_id = hex::encode(id);
-        u.index.insert_upload(&UploadRow {
+        t.index.insert_upload(&UploadRow {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -933,7 +1152,7 @@ impl Vault {
 
     fn get_upload(
         &self,
-        u: &Unlocked,
+        t: &TenantRt,
         bucket: &str,
         key: &str,
         upload_id: &str,
@@ -941,7 +1160,7 @@ impl Vault {
         if !upload_id.bytes().all(|c| c.is_ascii_hexdigit()) || upload_id.len() != 32 {
             return Err(VaultError::NoSuchUpload);
         }
-        match u.index.get_upload(upload_id)? {
+        match t.index.get_upload(upload_id)? {
             Some(up) if up.bucket == bucket && up.key == key => Ok(up),
             _ => Err(VaultError::NoSuchUpload),
         }
@@ -957,16 +1176,17 @@ impl Vault {
         content_md5: Option<[u8; 16]>,
     ) -> VResult<String> {
         let u = self.unlocked()?;
-        self.get_upload(&u, bucket, key, upload_id)?;
+        let (_, t) = self.tenant_of(&u, bucket)?;
+        self.get_upload(&t, bucket, key, upload_id)?;
         if !(1..=10_000).contains(&part_number) {
             return Err(VaultError::InvalidRequest(
                 "part number must be 1..10000".into(),
             ));
         }
-        let dir = self.staging_dir.join(upload_id);
+        let dir = self.tenant_staging(&t).join(upload_id);
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{part_number:05}"));
-        let spool = spool_stream(body, SpoolWriter::persistent(&path, &u.spool_key))
+        let spool = spool_stream(body, SpoolWriter::persistent(&path, &t.keys.staging_key))
             .await
             .map_err(|e| VaultError::InvalidRequest(format!("reading the part body: {e}")))?;
         if let Some(md5) = content_md5
@@ -976,7 +1196,7 @@ impl Vault {
             return Err(VaultError::BadDigest);
         }
         let etag = spool.md5_hex();
-        u.index.upsert_part(
+        t.index.upsert_part(
             upload_id,
             &PartRow {
                 part_number: part_number as i64,
@@ -990,8 +1210,9 @@ impl Vault {
 
     pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &str) -> VResult<Vec<PartRow>> {
         let u = self.unlocked()?;
-        self.get_upload(&u, bucket, key, upload_id)?;
-        Ok(u.index.parts(upload_id)?)
+        let (_, t) = self.tenant_of(&u, bucket)?;
+        self.get_upload(&t, bucket, key, upload_id)?;
+        Ok(t.index.parts(upload_id)?)
     }
 
     pub fn list_uploads(
@@ -1001,8 +1222,8 @@ impl Vault {
         limit: usize,
     ) -> VResult<Vec<UploadRow>> {
         let u = self.unlocked()?;
-        self.bucket(bucket)?;
-        Ok(u.index.list_uploads(bucket, prefix, limit)?)
+        let (_, t) = self.tenant_of(&u, bucket)?;
+        Ok(t.index.list_uploads(bucket, prefix, limit)?)
     }
 
     pub async fn complete_upload(
@@ -1013,18 +1234,18 @@ impl Vault {
         parts: Vec<(i32, String)>,
     ) -> VResult<ObjInfo> {
         let u = self.unlocked()?;
-        let b = self.bucket(bucket)?;
-        let up = self.get_upload(&u, bucket, key, upload_id)?;
+        let (b, t) = self.tenant_of(&u, bucket)?;
+        let up = self.get_upload(&t, bucket, key, upload_id)?;
         if parts.is_empty() {
             return Err(VaultError::InvalidPart("no parts".into()));
         }
-        let staged: HashMap<i64, PartRow> = u
+        let staged: HashMap<i64, PartRow> = t
             .index
             .parts(upload_id)?
             .into_iter()
             .map(|p| (p.part_number, p))
             .collect();
-        let dir = self.staging_dir.join(upload_id);
+        let dir = self.tenant_staging(&t).join(upload_id);
         let mut spools = Vec::new();
         let mut md5s = Md5::new();
         let mut prev = 0;
@@ -1046,7 +1267,7 @@ impl Vault {
             size += p.size;
             spools.push(Spool::open_file(
                 &dir.join(format!("{n:05}")),
-                &u.spool_key,
+                &t.keys.staging_key,
                 p.size,
             ));
         }
@@ -1080,23 +1301,24 @@ impl Vault {
         let streams: Vec<ByteStream> = spools.iter().map(|s| s.stream()).collect();
         let body: ByteStream = Box::pin(futures::stream::iter(streams).flatten());
         let _g = self.lock_key(bucket, key).await;
-        let existing = u.index.get(bucket, key)?;
+        let existing = t.index.get(bucket, key)?;
         let generation = next_generation(existing.map(|r| r.generation));
         self.write_object(
-            &u, &b.store, bucket, key, body, &info, sha256, generation, false, 0,
+            &t, &b.store, bucket, key, body, &info, sha256, generation, false, 0,
         )
         .await?;
         drop(spools);
-        u.index.delete_upload(upload_id)?;
+        t.index.delete_upload(upload_id)?;
         let _ = tokio::fs::remove_dir_all(&dir).await;
         Ok(info)
     }
 
     pub async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) -> VResult<()> {
         let u = self.unlocked()?;
-        self.get_upload(&u, bucket, key, upload_id)?;
-        u.index.delete_upload(upload_id)?;
-        let _ = tokio::fs::remove_dir_all(self.staging_dir.join(upload_id)).await;
+        let (_, t) = self.tenant_of(&u, bucket)?;
+        self.get_upload(&t, bucket, key, upload_id)?;
+        t.index.delete_upload(upload_id)?;
+        let _ = tokio::fs::remove_dir_all(self.tenant_staging(&t).join(upload_id)).await;
         Ok(())
     }
 
@@ -1104,18 +1326,27 @@ impl Vault {
     pub async fn expire_uploads(&self) -> VResult<usize> {
         let u = self.unlocked()?;
         let cutoff = now_ms() - (self.cfg.server.upload_ttl_hours as i64) * 3_600_000;
-        let ids = u.index.expired_uploads(cutoff)?;
-        for id in &ids {
-            u.index.delete_upload(id)?;
-            let _ = tokio::fs::remove_dir_all(self.staging_dir.join(id)).await;
+        let mut n = 0;
+        for t in u.loaded_tenants() {
+            let ids = t.index.expired_uploads(cutoff)?;
+            for id in &ids {
+                t.index.delete_upload(id)?;
+                let _ = tokio::fs::remove_dir_all(self.tenant_staging(&t).join(id)).await;
+            }
+            n += ids.len();
         }
-        Ok(ids.len())
+        Ok(n)
     }
 
     // ---------------------------------------------------------------- fill state helpers
 
     pub fn fill_state(&self, bucket: &str) -> VResult<FillRow> {
-        Ok(self.unlocked()?.index.fill_get(bucket)?)
+        let u = self.unlocked()?;
+        let b = self.bucket(bucket)?;
+        let t = u
+            .tenant_loaded(&b.tenant)
+            .ok_or_else(|| VaultError::Unavailable("tenant not loaded".into()))?;
+        Ok(t.index.fill_get(bucket)?)
     }
 
     pub fn meta_bucket_name() -> &'static str {

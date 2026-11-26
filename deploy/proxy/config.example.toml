@@ -42,11 +42,13 @@ read_timeout_secs = 60
 [[buckets]]
 name = "app"
 store = "primary"
+tenant = "app"                     # the tenant whose key encrypts this bucket (s3vault-keyd tenant-create)
 fallback = { source = "legacy", bucket = "app" }
 
 [[buckets]]
 name = "scratch"
 store = "primary"
+tenant = "scratch"                     # the tenant whose key encrypts this bucket (s3vault-keyd tenant-create)
 
 # Clients: access keys scoped per bucket. Generate with `s3vault gen-client --secret-out FILE`.
 [[clients]]

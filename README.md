@@ -7,8 +7,14 @@ from a *fallback* (an old plain store), serve the object and write it back encry
 the background. The keyring lives in RAM only; it comes from `s3vault-keyd` on another host.
 
 Threat model in short: the store of record (a cloud provider) is not trusted with content or names; the
-proxy host is trusted while running (its RAM holds the keyring); the key service host is trusted to keep the
-keyring. Losing every copy of the keyring loses the data.
+proxy host is trusted while running (its RAM holds the keys); the key service host is trusted to keep the
+keys. Losing every copy of the master keyring loses the data.
+
+Every bucket belongs to a **tenant** (a user or a space). Each tenant has its own random secret, mixed
+into every key and name of its objects (object format v2): destroying that secret makes the tenant's data
+unreadable everywhere a copy lives (store versions, follower copies, index snapshots, staging files)
+without touching ciphertext. Erasures are recorded in a hash-chained **erasure ledger** that every restore
+replays. See [Keys and tenants](#keys-and-tenants) and [docs/erasure-runbook.md](docs/erasure-runbook.md).
 
 ```
 client --S3 (private net/loopback)--> s3vault (proxy host) --TLS--> store of record (e.g. B2, Garage, MinIO)
@@ -22,12 +28,19 @@ owner's offline keyring backup. A real deployment is described in [Example deplo
 
 ## What the store of record sees
 
-One object per client object, under a flat keyed-hash name `o/<52 base32 chars>`. Each object is a 64-byte
-preamble, an encrypted header (bucket, key, size, ETag, SHA-256, content type, metadata, generation,
-tombstone flag; padded to 1 KiB steps so key lengths do not show) and the body in 64 KiB XChaCha20-Poly1305
-chunks. It learns object count, exact sizes (no padding, by owner decision), write and read timing, and
-overwrites. It does not learn names, prefixes, bucket names, content types or content. Tampering, truncation,
-swapping and rollback of an object fail authentication (500, never wrong data).
+One object per client object, named `o/<tenant tag>/<52 base32 chars>`: the tag (16 characters, an opaque
+keyed hash of the tenant id) groups a tenant's objects, so one tenant's objects can be copied, restored,
+exported or purged alone; the rest is a keyed hash of the bucket and key under the tenant's name key. Each
+object (format v2) is a 64-byte preamble (magic `S3VAULT2`), a 32-byte tenant box (the tenant id, sealed
+under a master subkey, so a rebuild with the root knows which tenant key opens the header), an encrypted
+header (bucket, key, size, ETag, SHA-256, content type, metadata, generation, tombstone flag; padded to
+1 KiB steps so key lengths do not show) and the body in 64 KiB XChaCha20-Poly1305 chunks.
+
+The store learns object count, exact sizes (no padding, by owner decision), write and read timing,
+overwrites, and which objects belong to the same tenant (the tag; the price of per-tenant backups). It
+does not learn names, prefixes, bucket names, tenant names, content types or content. Tampering,
+truncation, swapping (also between tenants) and rollback of an object fail authentication (500, never
+wrong data).
 
 The store plus the keyring alone rebuild everything (`s3vault rebuild`); the local index is a cache.
 
@@ -35,12 +48,13 @@ The store plus the keyring alone rebuild everything (`s3vault rebuild`); the loc
 
 | What | Where | Files |
 |---|---|---|
-| `s3vault` (systemd `s3vault.service`) | proxy | `/usr/local/bin/s3vault`, `/etc/s3vault/config.toml`, `/etc/s3vault/secrets/*` (root:s3vault 640), `/var/lib/s3vault/` (index.db SQLCipher, spool, staging) |
+| `s3vault` (systemd `s3vault.service`) | proxy | `/usr/local/bin/s3vault`, `/etc/s3vault/config.toml`, `/etc/s3vault/secrets/*` (root:s3vault 640), `/var/lib/s3vault/`: `system.db` (SQLCipher, fingerprint and freeze flags), `tenants/<tenant id>.db` (one SQLCipher index per tenant, under its tenant key), `ledger.jsonl` (copy of the erasure ledger), `outbox.jsonl` (erasures recorded here, to import into the key service), `erasures/<id>/` (manifests, proofs), `spool/`, `staging/<tenant id>/` |
 | S3 listeners | proxy | `127.0.0.1:9100` and a private (e.g. Tailscale) address, port 9100. Never a public IP; firewall the rest |
 | Admin API | proxy | `127.0.0.1:9101` (status, fill, verify, reconcile, snapshot, unlock); loopback only, bearer token from `/etc/s3vault/secrets/admin.token` |
 | Source and build tree | proxy | `/opt/s3vault/src` (clone of this repository) |
-| `s3vault-keyd` (container `s3vault-keyd`) | key host | `/srv/s3vault-keyd/` (compose, Dockerfile, `bin/`, `keys/` root 700 with `keyring` and `psk`, 600); listens on its private address, port 7373, allows only the proxy's address |
-| Keyring backup | owner | `~/.s3vault/master.key` (600). Keep a second offline copy. **Lose every copy and the data is gone.** |
+| `s3vault-keyd` (container `s3vault-keyd`) | key host | `/srv/s3vault-keyd/` (compose, Dockerfile, `bin/`, `keys/` root 700: `keyring` (master, v2), `tenants` (tenant keyring), `ledger.jsonl` (erasure ledger), `escrow/` (sealed tenant-keyring copies), `psk`; files 600); listens on its private address, port 7373, allows only the proxy's address |
+| Master keyring backup | owner | `~/.s3vault/master.key` (600) plus a second offline copy in another place. Rarely changes (only on a root change). **Lose every copy and the data is gone.** |
+| Tenant keyring escrow | owner | `~/.s3vault/tenant-escrow/tenants-<time>.sealed` (sealed under the master; a new copy after every tenant change; copies older than 30 days are pruned, the newest is kept) |
 
 Hardening on the proxy: swap off, core dumps off (`kernel.core_pattern=|/bin/false`), the unit has
 `LimitMEMLOCK=infinity`, `LimitCORE=0`, `MemorySwapMax=0`; the process calls `mlockall` and
@@ -65,10 +79,13 @@ Key service on the key host (once):
 ```sh
 cd /srv/s3vault-keyd                  # contains deploy/keyd/* and bin/s3vault-keyd
 docker compose build
-docker compose run --rm init          # creates keys/keyring and keys/psk (root, 600); prints the fingerprint only
+docker compose run --rm init          # creates keys/keyring (master v2) and keys/psk (root, 600); prints the fingerprint only
 docker compose up -d keyd
-docker compose run --rm fingerprint   # non-secret fingerprint and key ids
+docker compose run --rm fingerprint   # non-secret fingerprint, escrow state, tenants, ledger head
 ```
+
+Then escrow the master keyring (the proxy refuses an unescrowed root) and create the tenants, as in
+[Keys and tenants](#keys-and-tenants).
 
 Copy the PSK to the proxy and the keyring to the owner's Mac without printing them:
 
@@ -107,10 +124,61 @@ locked (503) until the key service is back. `sva -X POST 127.0.0.1:9101/unlock` 
 The index is encrypted with a key derived from the keyring, and it records the keyring fingerprint: a
 different keyring refuses to open it.
 
+## Keys and tenants
+
+**Master keyring (format v2).** One random root; everything else derives from it deterministically: the
+key-encryption keys of every generation (`KEK[n] = HKDF(root, "s3vault/v2/kek" || n)`), the name root, the
+tenant-box key, the tenant-tag key, the system-database key and the tenant-escrow key. Rotation
+(`docker compose run --rm admin rotate --dir /keys`) only moves `active` to the next generation: no new
+secret, so the offline copy of the root keeps covering every rotation (review H2). The root itself must
+have a confirmed escrow copy before any proxy uses it:
+
+```sh
+(umask 077; ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T escrow-export' > ~/.s3vault/master.key)
+s3vault escrow-digest --file ~/.s3vault/master.key                     # computed where the copy is
+ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm admin escrow-confirm --dir /keys --digest <digest> --place owner-mac'
+# second offline copy: copy the file to the second place, run escrow-digest there, confirm with --place <it>
+```
+
+**Tenants.** A tenant has a random id and a random 256-bit secret `K_t`, kept only in the key service's
+tenant keyring (never in a database, never in a backup of the application, never in the store). Its object
+keys, names, index key and staging key all mix in `K_t`. A tenant is created **pending** and is not
+served until an escrow copy of the tenant keyring that holds it is confirmed, so a tenant key never exists
+only on the key host:
+
+```sh
+ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm admin tenant-create --dir /keys --name <tenant>'
+mkdir -p ~/.s3vault/tenant-escrow
+ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T admin escrow-cat --dir /keys' \
+  > ~/.s3vault/tenant-escrow/tenants-$(date +%s).sealed
+s3vault tenant-escrow-check --file ~/.s3vault/tenant-escrow/<that file> --keyring ~/.s3vault/master.key
+ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm admin tenant-escrow-confirm --dir /keys --digest <digest> --place owner-mac'
+ssh root@<proxy> 'sva -X POST 127.0.0.1:9101/unlock'     # the running proxy picks up the active tenant
+```
+
+The escrow copy is sealed under a key derived from the master root, so the master copy plus the newest
+tenant escrow copy restore every tenant.
+
+**Escrow retention (R_tk = 30 days).** Every tenant change (create, erase) issues a new escrow copy. Copies
+older than 30 days are deleted, except the newest, which never holds an erased tenant's key (an erasure
+always issues a new copy). Run daily, on the key host and on the owner's device:
+
+```sh
+docker compose run --rm admin escrow-prune --dir /keys --max-age-days 30       # key host (cron or a systemd timer)
+s3vault escrow-prune --dir ~/.s3vault/tenant-escrow --max-age-days 30          # owner's device (cron or launchd)
+```
+
+After an erasure, the owner copies and confirms the new escrow copy (as above); 30 days later the last
+copy holding the erased tenant's key is gone, which is the crypto-erasure deadline for escrow.
+
+**What the proxy receives.** Protocol v2 (`S3VKEY02`): the master keyring, the tenant keyring and the
+erasure ledger. Protocol v1 clients (an older proxy binary, for a rollback) receive the legacy v1 keyring
+kept inside the v2 master after `upgrade-v2`.
+
 ## Clients and buckets
 
-Buckets are configuration, not API (`CreateBucket` is refused). Each `[[buckets]]` names a store and an
-optional fallback `{ source, bucket }`. Several client buckets can share one store bucket; the bucket name is
+Buckets are configuration, not API (`CreateBucket` is refused). Each `[[buckets]]` names a store, its
+`tenant` and an optional fallback `{ source, bucket }`. Several client buckets can share one store bucket; the bucket name is
 inside the keyed hash, so the store cannot tell them apart.
 
 ```sh
@@ -162,7 +230,12 @@ point the client at s3vault.
 
 ## Rotate
 
-- **Content key** (escrow first; review H2). A rotated key is **pending**: it is served but never used for
+- **Key-encryption key, format v2**: `docker compose run --rm admin rotate --dir /keys` moves to the next
+  generation (derived from the root; nothing to escrow), then `systemctl restart s3vault`. Old generations
+  stay derivable, so old objects stay readable.
+- **Tenant secret**: not rotated in place. After a suspected leak of one tenant's key: create a new tenant,
+  copy its objects over (S3 copy between the two buckets), erase the old tenant (not automated).
+- **Content key, legacy v1 keyring** (escrow first; review H2). A rotated key is **pending**: it is served but never used for
   writes until an offline copy holding it is confirmed, so a key can never exist only on the key host.
 
   ```sh
@@ -179,7 +252,8 @@ point the client at s3vault.
   active. The proxy enforces the same rule: it writes under the highest **escrowed** key (`/status`:
   `write_kid`, `active_kid_escrowed`, `escrow_places`), so a hand-edited or old-binary rotation cannot
   create data under an unescrowed key. Nothing is re-encrypted. Keep two offline copies in different places.
-- **Name key**: never rotates in place (every object would be renamed). Not supported.
+- **Name root and master root**: never rotate in place (every object would be renamed and re-keyed). Not
+  supported.
 - **PSK**: stop keyd, replace `keys/psk` with a fresh `s3vault-psk v1 <base64 32 bytes>` (e.g. move the old
   files aside and run `init` in a scratch dir, keep only `psk`), start keyd, copy it to the proxy as above. Running
   proxies are unaffected; the next start needs the new PSK.
@@ -188,36 +262,97 @@ point the client at s3vault.
 
 ## Rebuild the index
 
-The index can always be rebuilt from the store and the keyring (every object's header names its bucket, key,
-generation and tombstone state). Stop the service first, rebuild into a new file, then move it into place:
+Each tenant's index partition can always be rebuilt from the store and the keys (every object's header
+names its bucket, key, generation and tombstone state, and only the tenant's prefix `o/<tag>/` is listed).
+The rebuild first **replays the erasure ledger** on the stores (so a restored store never brings erased
+data back), then rebuilds into a fresh data directory:
 
 ```sh
 systemctl stop s3vault
 runuser -u s3vault -- s3vault rebuild --config /etc/s3vault/config.toml \
-    --index /var/lib/s3vault/index.rebuilt.db [--snapshot] [--concurrency 32]
-mv /var/lib/s3vault/index.db /var/lib/s3vault/index.db.old; rm -f /var/lib/s3vault/index.db-wal /var/lib/s3vault/index.db-shm
-mv /var/lib/s3vault/index.rebuilt.db /var/lib/s3vault/index.db
+    --out /var/lib/s3vault.rebuilt [--tenant NAME] [--snapshot] [--concurrency 32]
+# whole directory: keep the outbox, swap the directories
+cp -p /var/lib/s3vault/outbox.jsonl /var/lib/s3vault.rebuilt/ 2>/dev/null
+mv /var/lib/s3vault /var/lib/s3vault.old && mv /var/lib/s3vault.rebuilt /var/lib/s3vault
+# one tenant only (--tenant): move just its partition, tenants/<id>.db, into /var/lib/s3vault/tenants/
 systemctl start s3vault
 ```
 
-`--snapshot` starts from the latest encrypted index snapshot (written every `index_snapshot_secs` when the
-index changed, or by `POST /snapshot`) and reads only headers of objects written since (store Last-Modified)
-or unknown to it. The snapshot is streamed and applied in transactions, and the name sets of the rebuild
-live in a scratch sqlite file next to the index (removed at the end), so RAM stays bounded at any index
-size (see `tests/scale.rs`; the production-size drill is described there). Without it, every header is read (one ranged GET of about 2 KiB per object; budget hours for
-millions of objects). Fill cursors and unfinished multipart uploads are not in the store and start over.
+`--snapshot` starts from the tenant's latest encrypted index snapshot (one per tenant, sealed under the
+tenant key and stored under its tag; written every `index_snapshot_secs` when the tenant's index changed,
+or by `POST /snapshot`) and reads only headers of objects written since (store Last-Modified) or unknown to
+it. The snapshot is streamed and applied in transactions, and the name sets of the rebuild live in a
+scratch sqlite file next to the index (removed at the end), so RAM stays bounded at any index size (see
+`tests/scale.rs`). Without it, every header of the tenant is read (one ranged GET of about 2 KiB per
+object; budget hours for millions of objects). Fill cursors and unfinished multipart uploads are not in the
+store and start over. `--no-replay` skips the ledger replay.
 
-Disaster recovery on a new host: same command with `--keyring-file ~/.s3vault/master.key`
+Disaster recovery on a new host: same command with `--keyring-file ~/.s3vault/master.key`,
+`--tenants-file <tenant keyring opened from the newest escrow copy>`, `--ledger-file <a ledger copy>`
 and a config pointing at the store.
+
+## Erasure and the erasure ledger
+
+Erasing a tenant (a user or a space): the key service destroys `K_t` and records it in the ledger
+(`tenant-erase`), then the proxy drops it, deletes the tenant's index partition and staging files, purges
+the store by manifest and by prefix, and returns a proof record (`POST /tenant/erase`). Erasing one object
+(a third party's recording): `POST /object/erase?bucket=B&key=K&confirm=1`. The step-by-step procedure,
+the deadlines and how to show the proof are in [docs/erasure-runbook.md](docs/erasure-runbook.md).
+
+The **erasure ledger** (`keys/ledger.jsonl` on the key host, authoritative; a copy in the proxy's data
+directory and with the owner) is a hash-chained JSON-lines file of opaque ids only: erased tenants (id and
+tag), erased object versions (store name and the hash of the object's head) and proof records. Proxy
+entries go to its outbox and are imported on the key host:
+
+```sh
+ssh root@<proxy> 'sva 127.0.0.1:9101/ledger/outbox' \
+  | ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T admin ledger-import --dir /keys'
+```
+
+**Replay after every restore** (before the restored data is served):
+
+| Restored | Command |
+|---|---|
+| the store of record (a backup, or B2 versions re-promoted) | `sva -X POST '127.0.0.1:9101/ledger/replay?dry_run=1'`, then without `dry_run` (or `s3vault ledger-replay --config ... --store NAME`) |
+| a follower copy (a directory copied from the store) | `s3vault ledger-replay --config ... --dir /path/to/copy --prefix o/ --ledger ledger.jsonl` (needs no key) |
+| the proxy's index (rebuild, snapshot) | `s3vault rebuild` replays first (above) |
+| the key service from an old backup | nothing to do on the proxy: it keeps its ledger copy and refuses a tenant the ledger lists as erased; restore the ledger file from the proxy's copy (`GET /ledger`) |
+| application databases (for example per-space Mongo backups) | the application's restore runbook reads the same ledger (see `docs/per-tenant-backups.md`) |
+
+## Migrate from format v1
+
+A v1 deployment (one keyring, flat names) moves to v2 in place, with no read from the fallback:
+
+1. Key host: back up `keys/`, install the new binary, `docker compose run --rm admin upgrade-v2 --dir /keys`
+   (new random root; the v1 keys stay inside as legacy keys, so a v1 proxy binary still unlocks), escrow
+   the new master keyring (above), create the tenants and confirm their escrow copy.
+2. Proxy: add `tenant = "..."` to every `[[buckets]]`, stop the service, then
+
+   ```sh
+   runuser -u s3vault -- s3vault migrate-v2 --config /etc/s3vault/config.toml --old-index /var/lib/s3vault/index.db
+   ```
+
+   Every v1 object is read with the legacy keys, checked against its recorded SHA-256 and written again as
+   a v2 object of its bucket's tenant (ETag, metadata, Last-Modified, generation and fill origin kept).
+   Fill cursors move along; unfinished multipart uploads do not. Start the service and run the pass
+   checks. Then `mv index.db index.v1.db` and, once satisfied, run the same command with `--delete-v1`
+   (idempotent: it re-encrypts nothing and deletes the v1 objects and the v1 snapshot).
+
+Rollback before `--delete-v1`: the previous binary with the previous config and `index.db` still works
+(the key service serves it the legacy keyring).
 
 ## Switch the store of record to Backblaze B2
 
 The owner, in the B2 web console or with the `b2` CLI:
 
-1. Create a **private** bucket, e.g. `<name>-vault` (no B2 server-side encryption needed: the data is already
-   encrypted; object lock optional). Lifecycle: "keep only the last version" with a few days before deletion
-   is a good compromise (old ciphertext versions of overwritten and tombstoned keys cost storage; a short
-   window helps against accidental deletes).
+1. Choose an **EU region** at account sign-up (the region is fixed per account) and create a **private**
+   bucket, e.g. `<name>-vault` (no B2 server-side encryption needed: the data is already encrypted; object
+   lock **off**: it would block erasure). Lifecycle (decision D2): **keep only the last version, 7 days from
+   hide to delete**, for the whole bucket:
+   `b2 bucket update --lifecycle-rule '{"daysFromHidingToDeleting": 7, "daysFromUploadingToHiding": null, "fileNamePrefix": ""}' <name>-vault allPrivate`
+   (console: Lifecycle Settings, "Keep only the last version of the file"). The 7 days are both the undelete
+   window and the physical-erasure tail of an erasure. Sign Backblaze's DPA first (see
+   `docs/gdpr/processor-agreements.md`).
 2. Create an **application key restricted to that bucket** with `listBuckets, listFiles, readFiles,
    writeFiles, deleteFiles` (`b2 key create --bucket <name>-vault s3vault listBuckets,listFiles,readFiles,writeFiles,deleteFiles`).
    Keep the account master key offline. Note the key id, the key, and the bucket's S3 endpoint

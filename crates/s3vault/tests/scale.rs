@@ -14,7 +14,7 @@ use s3vault::index::{Index, LIVE, ObjRow};
 use s3vault::remote::{
     ByteStream, ListItem, ListPage, RResult, Remote, RemoteMeta, StoreView,
 };
-use s3vault_format::keyring::Keyring;
+use s3vault_format::keys2::{Bundle, MasterV2, TenantKeyring, TenantKeys};
 use s3vault_format::object;
 use std::path::Path;
 use std::sync::Arc;
@@ -122,7 +122,7 @@ fn synthetic_row(i: u64) -> ObjRow {
 struct SynthView {
     inner: Arc<Remote>,
     source: Arc<Index>,
-    name_key: s3vault_format::keyring::Key32,
+    tk: Arc<s3vault::vault::TenantRt>,
     prefix: String,
     total: u64,
     old_ms: i64,
@@ -149,7 +149,7 @@ impl StoreView for SynthView {
                 key: format!(
                     "{}{}",
                     self.prefix,
-                    object::store_name(&self.name_key, &r.bucket, &r.key)
+                    object::store_name_v2(&self.tk.keys, &r.bucket, &r.key)
                 ),
                 size: r.size,
                 etag: String::new(),
@@ -196,8 +196,13 @@ async fn streamed_rebuild_at_scale() {
         format!("access_key_id = \"{AK}\"\nsecret_access_key = \"{SK}\"\n"),
     )
     .unwrap();
-    let kr_text = Keyring::generate().to_text();
-    std::fs::write(dir.join("keyring"), kr_text.as_bytes()).unwrap();
+    let mut m = MasterV2::generate(None);
+    m.confirm_escrow(&m.escrow_digest(), "test", 1).unwrap();
+    let mut tk = TenantKeyring::default();
+    tk.create("t1", 1).unwrap();
+    let copy = tk.clone();
+    tk.confirm_escrow(&copy, "d", "test", 1).unwrap();
+    let bundle_text = format!("%master\n{}%tenants\n{}%ledger\n", m.to_text().as_str(), tk.to_text().as_str());
     let cfg_text = format!(
         r#"
 [server]
@@ -218,6 +223,7 @@ read_timeout_secs = 600
 [[buckets]]
 name = "data"
 store = "main"
+tenant = "t1"
 "#,
         d = dir.display()
     );
@@ -239,8 +245,9 @@ store = "main"
     .unwrap();
 
     let vault = s3vault::vault::Vault::new(cfg.clone()).unwrap();
-    vault.unlock(Keyring::parse(&kr_text).unwrap()).unwrap();
-    let src = vault.unlocked().unwrap().index.clone();
+    vault.unlock(Bundle::parse(&bundle_text).unwrap()).unwrap();
+    let tenant = vault.unlocked().unwrap().tenant_loaded("t1").unwrap();
+    let src = tenant.index.clone();
     let rss0 = rss_bytes();
 
     // 1. the source index
@@ -263,19 +270,19 @@ store = "main"
     assert_eq!(snap.rows, n);
 
     // 3. rebuild --snapshot into a fresh index with the synthesised listing
-    let kr = Keyring::parse(&kr_text).unwrap();
-    let fresh = Index::open(&dir.join("rebuilt.db"), Some(&kr.index_db_key())).unwrap();
+    let keys: &TenantKeys = &tenant.keys;
+    let fresh = Index::open(&dir.join("rebuilt.db"), Some(&keys.index_key)).unwrap();
     let view: Arc<dyn StoreView> = Arc::new(SynthView {
         inner: vault.stores["main"].clone(),
         source: src.clone(),
-        name_key: kr.name_key(),
+        tk: tenant.clone(),
         prefix: "o/".into(),
         total: n,
         old_ms: s3vault::vault::now_ms() - 7_200_000,
     });
     let t = Instant::now();
     let s = Sampler::start();
-    let rep = s3vault::background::rebuild_with(vault.clone(), &kr, &fresh, true, 16, &|_| {
+    let rep = s3vault::background::rebuild_with(vault.clone(), keys, &fresh, true, 16, &|_| {
         view.clone()
     })
     .await
