@@ -1,0 +1,11 @@
+[package]
+name = "s3vault-keyd"
+description = "s3vault key service: serves the master keyring to allow-listed proxies over a mutual-PSK protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s3vault-format.workspace = true
+zeroize.workspace = true
+libc = "0.2"

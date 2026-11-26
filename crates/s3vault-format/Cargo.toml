@@ -1,0 +1,20 @@
+[package]
+name = "s3vault-format"
+description = "s3vault object format, keyring and key-service protocol (pure Rust, no async runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+data-encoding.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+subtle.workspace = true

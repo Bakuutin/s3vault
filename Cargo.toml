@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/s3vault-format", "crates/s3vault", "crates/s3vault-keyd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+s3vault-format = { path = "crates/s3vault-format" }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+data-encoding = "2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+subtle = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+debug = 0

@@ -1,0 +1,60 @@
+# s3vault configuration (example: the deployment on host w).
+# Secrets are never inline: every *_file below is a separate file, mode 600/640, root:s3vault.
+
+[server]
+# Private addresses only: loopback and the Tailscale address. Never a public IP.
+listen = ["127.0.0.1:9100", "100.64.0.2:9100"]
+admin_listen = "127.0.0.1:9101"
+data_dir = "/var/lib/s3vault"
+region = "us-east-1"
+memory_spool_max = 16777216          # bodies above 16 MiB spool to encrypted local files
+store_multipart_threshold = 536870912
+store_multipart_part = 67108864
+index_snapshot_secs = 21600          # encrypted index snapshot every 6 h when it changed
+upload_ttl_hours = 168
+
+[keys]
+# The keyring comes from s3vault-keyd on d and is held in RAM only. Until it arrives every request is 503.
+source = "keyd"
+keyd_addr = "100.64.0.1:7373"
+psk_file = "/etc/s3vault/secrets/keyd.psk"
+retry_secs = 10
+
+# Store of record. Today: a local Garage on w (loopback). Later: Backblaze B2 (see vault/README.md).
+[stores.primary]
+endpoint = "http://127.0.0.1:3910"
+region = "garage"
+bucket = "s3vault-store"
+credentials_file = "/etc/s3vault/secrets/store-local-garage.toml"
+prefix = "o/"
+read_timeout_secs = 120
+
+# Read-through source (plain, read-only key). Used for keys the store of record does not have yet.
+[fallbacks.d-garage]
+endpoint = "http://100.64.0.1:3900"
+region = "garage"
+credentials_file = "/etc/s3vault/secrets/fallback-d-garage.toml"
+connect_timeout_secs = 5
+read_timeout_secs = 60
+
+[[buckets]]
+name = "media"
+store = "primary"
+fallback = { source = "d-garage", bucket = "media" }
+
+[[buckets]]
+name = "scratch"
+store = "primary"
+
+# Clients: access keys scoped per bucket. Generate with `s3vault gen-client --secret-out FILE`.
+[[clients]]
+name = "admin-test"
+access_key_id = "SVEXAMPLEEXAMPLE"
+secret_file = "/etc/s3vault/secrets/client-admin-test.secret"
+buckets = ["scratch"]
+read_buckets = ["media"]
+
+[fill]
+concurrency = 4
+rate_bytes_per_sec = 1000000         # default fill budget; live read-through misses are not limited
+yield_ms = 250

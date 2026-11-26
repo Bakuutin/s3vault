@@ -1,0 +1,39 @@
+[Unit]
+Description=s3vault encrypting S3 gateway
+Documentation=file:///usr/local/share/doc/s3vault/README.md
+After=network-online.target tailscaled.service s3vault-garage.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s3vault
+Group=s3vault
+ExecStart=/usr/local/bin/s3vault serve --config /etc/s3vault/config.toml
+Restart=always
+RestartSec=5
+# Keys live only in RAM: lock all memory, no core dumps, no swap for this unit.
+LimitMEMLOCK=infinity
+LimitCORE=0
+MemorySwapMax=0
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/s3vault
+ReadOnlyPaths=/etc/s3vault
+CapabilityBoundingSet=CAP_IPC_LOCK
+AmbientCapabilities=CAP_IPC_LOCK
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

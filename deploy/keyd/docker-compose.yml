@@ -1,0 +1,46 @@
+# s3vault key service. Serves the master keyring only to allow-listed proxy addresses that prove the PSK.
+# Lives in its own directory (e.g. /srv/s3vault-keys/) with ./keys (root, 700; files 600).
+#   first time:  docker compose build && docker compose run --rm init
+#   run:         docker compose up -d keyd
+# Edit LISTEN (this host's Tailscale address) and ALLOW (the proxy's Tailscale address) below.
+services:
+  keyd:
+    build: .
+    image: s3vault-keyd:local
+    container_name: s3vault-keyd
+    command: ["serve", "--dir", "/keys", "--listen", "100.64.0.1:7373", "--allow", "100.64.0.2"]
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ulimits:
+      core: 0
+    volumes:
+      - ./keys:/keys:ro
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "3" }
+
+  # One-shot helpers (profile "admin" keeps them out of `up`).
+  init:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    command: ["init", "--dir", "/keys"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys
+  rotate:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    command: ["rotate", "--dir", "/keys"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys
+  fingerprint:
+    profiles: ["admin"]
+    image: s3vault-keyd:local
+    command: ["fingerprint", "--dir", "/keys"]
+    network_mode: none
+    volumes:
+      - ./keys:/keys:ro

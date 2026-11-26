@@ -1,0 +1,292 @@
+//! Configuration (TOML). Secrets live in separate mode-600 files referenced from here, never inline.
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub server: ServerCfg,
+    pub keys: KeysCfg,
+    /// Stores of record: where the ciphertext lives (B2, Garage, MinIO, ...).
+    pub stores: BTreeMap<String, RemoteCfg>,
+    /// Read-through sources for keys not yet in the store of record (plain, read-only).
+    #[serde(default)]
+    pub fallbacks: BTreeMap<String, RemoteCfg>,
+    pub buckets: Vec<BucketCfg>,
+    #[serde(default)]
+    pub clients: Vec<ClientCfg>,
+    #[serde(default)]
+    pub fill: FillCfg,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ServerCfg {
+    /// S3 listeners. Bind only private addresses (loopback, Tailscale); the proxy has no rate limiting.
+    pub listen: Vec<String>,
+    /// Admin HTTP listener (status, fill, verify, snapshot). Keep it on loopback.
+    #[serde(default)]
+    pub admin_listen: Option<String>,
+    pub data_dir: PathBuf,
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Upload bodies up to this size are buffered in RAM; larger ones spool to encrypted local files.
+    #[serde(default = "default_mem_spool")]
+    pub memory_spool_max: usize,
+    /// Objects whose ciphertext exceeds this go to the store with a multipart upload.
+    #[serde(default = "default_mp_threshold")]
+    pub store_multipart_threshold: u64,
+    #[serde(default = "default_mp_part")]
+    pub store_multipart_part: u64,
+    /// Encrypted index snapshot to the first store every N seconds when the index changed (0 = off).
+    #[serde(default = "default_snapshot_secs")]
+    pub index_snapshot_secs: u64,
+    /// Multipart uploads not completed after this many hours are aborted.
+    #[serde(default = "default_upload_ttl")]
+    pub upload_ttl_hours: u64,
+}
+
+fn default_region() -> String {
+    "us-east-1".into()
+}
+fn default_mem_spool() -> usize {
+    16 << 20
+}
+fn default_mp_threshold() -> u64 {
+    512 << 20
+}
+fn default_mp_part() -> u64 {
+    64 << 20
+}
+fn default_snapshot_secs() -> u64 {
+    6 * 3600
+}
+fn default_upload_ttl() -> u64 {
+    7 * 24
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum KeySource {
+    /// Fetch the keyring from s3vault-keyd at start (held in RAM only).
+    Keyd,
+    /// Read the keyring from a local file (tests, disaster recovery on an owner machine).
+    File,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct KeysCfg {
+    pub source: KeySource,
+    #[serde(default)]
+    pub keyd_addr: Option<String>,
+    #[serde(default)]
+    pub psk_file: Option<PathBuf>,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    #[serde(default = "default_retry")]
+    pub retry_secs: u64,
+}
+
+fn default_retry() -> u64 {
+    10
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCfg {
+    pub endpoint: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Required for stores; fallbacks name their bucket per bucket entry.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// TOML file with `access_key_id` and `secret_access_key` (mode 600).
+    pub credentials_file: PathBuf,
+    /// Stores only: prefix for object names (default `o/`).
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_read_timeout")]
+    pub read_timeout_secs: u64,
+}
+
+fn default_prefix() -> String {
+    "o/".into()
+}
+fn default_connect_timeout() -> u64 {
+    5
+}
+fn default_read_timeout() -> u64 {
+    60
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BucketCfg {
+    /// The bucket name clients use.
+    pub name: String,
+    /// Key into `[stores]`.
+    pub store: String,
+    #[serde(default)]
+    pub fallback: Option<FallbackRef>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackRef {
+    /// Key into `[fallbacks]`.
+    pub source: String,
+    pub bucket: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCfg {
+    pub name: String,
+    pub access_key_id: String,
+    /// File holding the secret access key (one line, mode 600).
+    pub secret_file: PathBuf,
+    /// Buckets with read and write access.
+    #[serde(default)]
+    pub buckets: Vec<String>,
+    /// Buckets with read-only access.
+    #[serde(default)]
+    pub read_buckets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FillCfg {
+    #[serde(default = "default_fill_conc")]
+    pub concurrency: usize,
+    /// Byte budget for the background fill (bytes per second). Live read-through misses are not limited.
+    #[serde(default = "default_fill_rate")]
+    pub rate_bytes_per_sec: u64,
+    /// While a live read-through fetch is running, the fill pauses in steps of this many milliseconds.
+    #[serde(default = "default_fill_yield")]
+    pub yield_ms: u64,
+}
+
+impl Default for FillCfg {
+    fn default() -> Self {
+        FillCfg {
+            concurrency: default_fill_conc(),
+            rate_bytes_per_sec: default_fill_rate(),
+            yield_ms: default_fill_yield(),
+        }
+    }
+}
+
+fn default_fill_conc() -> usize {
+    4
+}
+fn default_fill_rate() -> u64 {
+    1_000_000
+}
+fn default_fill_yield() -> u64 {
+    250
+}
+
+#[derive(Deserialize)]
+pub struct S3Credentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S3Credentials({})", self.access_key_id)
+    }
+}
+
+pub fn read_credentials(path: &Path) -> Result<S3Credentials> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read credentials {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parse credentials {}", path.display()))
+}
+
+pub fn read_secret_line(path: &Path) -> Result<String> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read secret {}", path.display()))?;
+    let s = text.trim().to_string();
+    if s.is_empty() {
+        bail!("secret file {} is empty", path.display());
+    }
+    Ok(s)
+}
+
+/// Logical bucket used for the proxy's own metadata objects (index snapshots). Not addressable by clients.
+pub const META_BUCKET: &str = ".s3vault";
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Config> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read config {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.stores.is_empty() {
+            bail!("at least one [stores.<name>] is required");
+        }
+        for (name, s) in &self.stores {
+            if s.bucket.is_none() {
+                bail!("store {name}: bucket is required");
+            }
+        }
+        let mut seen = HashSet::new();
+        for b in &self.buckets {
+            if b.name == META_BUCKET || b.name.is_empty() {
+                bail!("bucket name {:?} is reserved", b.name);
+            }
+            if !seen.insert(b.name.clone()) {
+                bail!("bucket {} defined twice", b.name);
+            }
+            if !self.stores.contains_key(&b.store) {
+                bail!("bucket {}: unknown store {}", b.name, b.store);
+            }
+            if let Some(f) = &b.fallback
+                && !self.fallbacks.contains_key(&f.source)
+            {
+                bail!("bucket {}: unknown fallback {}", b.name, f.source);
+            }
+        }
+        let mut keys = HashSet::new();
+        for c in &self.clients {
+            if !keys.insert(c.access_key_id.clone()) {
+                bail!("client access key {} defined twice", c.access_key_id);
+            }
+            for b in c.buckets.iter().chain(&c.read_buckets) {
+                if !seen.contains(b) {
+                    bail!("client {}: unknown bucket {b}", c.name);
+                }
+            }
+        }
+        match self.keys.source {
+            KeySource::Keyd => {
+                if self.keys.keyd_addr.is_none() || self.keys.psk_file.is_none() {
+                    bail!("keys.source = \"keyd\" needs keyd_addr and psk_file");
+                }
+            }
+            KeySource::File => {
+                if self.keys.file.is_none() {
+                    bail!("keys.source = \"file\" needs file");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The store that holds index snapshots: the first one by name.
+    pub fn meta_store(&self) -> &str {
+        self.stores.keys().next().expect("validated")
+    }
+}
