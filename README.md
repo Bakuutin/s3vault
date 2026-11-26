@@ -149,9 +149,11 @@ only on the key host:
 ```sh
 ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm admin tenant-create --dir /keys --name <tenant>'
 mkdir -p ~/.s3vault/tenant-escrow
-ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T admin escrow-cat --dir /keys' \
-  > ~/.s3vault/tenant-escrow/tenants-$(date +%s).sealed
-s3vault tenant-escrow-check --file ~/.s3vault/tenant-escrow/<that file> --keyring ~/.s3vault/master.key
+ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm -T admin escrow-cat --dir /keys 2>/dev/null' \
+  > ~/.s3vault/tenant-escrow/new.sealed
+s3vault tenant-escrow-check --file ~/.s3vault/tenant-escrow/new.sealed --keyring ~/.s3vault/master.key
+# prints "digest D issued T ..."; name the copy by its issue time (escrow-prune reads it from the name):
+mv ~/.s3vault/tenant-escrow/new.sealed ~/.s3vault/tenant-escrow/tenants-T.sealed
 ssh <keyhost> 'cd /srv/s3vault-keyd && docker compose run --rm admin tenant-escrow-confirm --dir /keys --digest <digest> --place owner-mac'
 ssh root@<proxy> 'sva -X POST 127.0.0.1:9101/unlock'     # the running proxy picks up the active tenant
 ```
@@ -282,8 +284,9 @@ systemctl start s3vault
 tenant key and stored under its tag; written every `index_snapshot_secs` when the tenant's index changed,
 or by `POST /snapshot`) and reads only headers of objects written since (store Last-Modified) or unknown to
 it. The snapshot is streamed and applied in transactions, and the name sets of the rebuild live in a
-scratch sqlite file next to the index (removed at the end), so RAM stays bounded at any index size (see
-`tests/scale.rs`). Without it, every header of the tenant is read (one ranged GET of about 2 KiB per
+scratch sqlite file next to the index (removed at the end), so RAM stays bounded at any index size
+(`tests/scale.rs`; drill at production size, 8.7M rows, release build: a 3.96 GB snapshot written in 155 s,
+the rebuild from it in 23 min at 31 MiB peak RSS, 108 MiB for the whole drill process). Without it, every header of the tenant is read (one ranged GET of about 2 KiB per
 object; budget hours for millions of objects). Fill cursors and unfinished multipart uploads are not in the
 store and start over. `--no-replay` skips the ledger replay.
 
@@ -445,9 +448,13 @@ The first deployment protects the audio store of the application (a personal aud
 | S3 listeners | `w` | `127.0.0.1:9100`, `100.64.0.2:9100` (Tailscale); firewalld zone `tailnet` (tailscale0) allows only ssh and 9100/tcp |
 | Store of record (stand-in until B2) | `w` | Garage, Podman quadlet `s3vault-garage.service` (`/etc/containers/systemd/s3vault-garage.container`, `/etc/s3vault-garage/garage.toml`, `/var/lib/s3vault-garage/`), S3 on `127.0.0.1:3910`, bucket `s3vault-store` |
 | Fallback `d-garage` | `d` | the application's plain Garage, `100.64.0.1:3900`, bucket `media` (about 8.7M objects, 851 GB; a full fill needs the owner's go-ahead) |
-| `s3vault-keyd` | `d` | `/srv/s3vault-keys/`, listens `100.64.0.1:7373`, allows `100.64.0.2` only |
-| Keyring backup | owner's Mac | `~/.s3vault-admin/vault-master.key` |
+| `s3vault-keyd` | `d` | `/srv/s3vault-keys/` (`keys/`: master keyring v2, tenants, ledger, `escrow/`; `backups/keys-<date>.tar` taken before each key-service change; `bin/s3vault-keyd.prev`), listens `100.64.0.1:7373`, allows `100.64.0.2` only; daily `escrow-prune` from admin's crontab (03:23, log `escrow-prune.log`) |
+| Master keyring backup | owner's Mac | `~/.s3vault-admin/vault-master.v2.key` (master v2, fingerprint `<fingerprint>`, escrowed as `owner-mac`; carries the legacy v1 keys). The v1 file `~/.s3vault-admin/vault-master.key` is now only needed for the v1 legacy keys, which the v2 file also holds. A second offline copy is an owner step |
+| Tenant keyring escrow | owner's Mac | `~/.s3vault-admin/tenant-escrow/tenants-<issued>.sealed` (prune with `s3vault escrow-prune --dir ~/.s3vault-admin/tenant-escrow --max-age-days 30`; scheduling it on the Mac is an owner step) |
 
-Buckets: `media` (fallback `d-garage`/`media`) and `scratch`. Clients: only the test client `admin-test`
-(read-write `scratch`, read-only `media`); the the application is not pointed at the proxy yet. Hardening on
-`w`: swap off (fstab entry commented, `swap.target` masked), `kernel.core_pattern=|/bin/false`.
+Tenants: `owner` (bucket `media`, fallback `d-garage`/`media`), `scratch` (bucket `scratch`); `drill` was
+created and erased on 2026-11-26 as the live erasure drill (ledger entries 1-2). Clients: only the test
+client `admin-test` (read-write `scratch` and `drill`, read-only `media`); the the application is not pointed
+at the proxy yet. The ~1,000 trial objects were migrated to format v2 (`migrate-v2`, then `--delete-v1`);
+the v1 index is kept as `/var/lib/s3vault/index.v1.db`. Hardening on `w`: swap off (fstab entry
+commented, `swap.target` masked), `kernel.core_pattern=|/bin/false`.
