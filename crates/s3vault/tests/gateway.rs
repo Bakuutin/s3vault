@@ -128,6 +128,10 @@ endpoint = "http://{fallback}"
 credentials_file = "{dir}/backend.toml"
 connect_timeout_secs = 1
 read_timeout_secs = 5
+# The outage tests kill the fallback: keep the retries short (the aws-sdk client retries 503s itself too).
+retry_attempts = 2
+retry_base_ms = 10
+retry_max_ms = 20
 
 [[buckets]]
 name = "data"

@@ -615,13 +615,19 @@ impl Vault {
         mut ct: ByteStream,
         total: u64,
     ) -> VResult<()> {
-        if total <= self.cfg.server.store_multipart_threshold {
+        // Every request body is held in memory so that a failed attempt can be repeated (review M4):
+        // objects up to one part go in one buffered PUT, larger ones as a multipart upload of parts.
+        let part_size = self.cfg.server.store_multipart_part.max(5 << 20) as usize;
+        if total <= self.cfg.server.store_multipart_threshold.min(part_size as u64) {
+            let mut buf = BytesMut::with_capacity(total as usize);
+            while let Some(c) = ct.next().await {
+                buf.extend_from_slice(&c?);
+            }
             return store
-                .put(name, reqwest::Body::wrap_stream(ct), total)
+                .put_bytes(name, buf.freeze())
                 .await
                 .map_err(|e| map_store(&store.label, e));
         }
-        let part_size = self.cfg.server.store_multipart_part.max(5 << 20) as usize;
         let upload_id = store
             .mp_create(name)
             .await
@@ -657,7 +663,7 @@ impl Vault {
         .await;
         match res {
             Ok(etags) => store
-                .mp_complete(name, &upload_id, &etags)
+                .mp_complete(name, &upload_id, &etags, total)
                 .await
                 .map_err(|e| map_store(&store.label, e)),
             Err(e) => {

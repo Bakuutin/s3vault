@@ -377,8 +377,20 @@ rclone copy src:s3vault-store/o/<tag> b2:<tenant bucket>/o/<tag> --checksum --tr
 Point the tenant's `[[buckets]]` at `t-<tenant>`. Stop writes (or accept a short window), copy again,
 `systemctl restart s3vault`, check `/status` and `POST /verify` (with the admin token). The index stays
 valid (it does not depend on the store endpoint). Tenants can move one at a time; the old store can be
-stopped when none is left on it. Store-side multipart is used above 512 MiB of ciphertext; B2's minimum
-part size (5 MB) is respected.
+stopped when none is left on it. Store-side multipart is used above one part (`store_multipart_part`, 64 MiB)
+of ciphertext; B2's minimum part size (5 MB) is respected.
+
+**Retries (review M4).** B2 answers 503 (and 500) under load and expects clients to retry. Every store and
+fallback request is retried with exponential backoff and jitter (a random delay between half and all of
+`retry_base_ms * 2^(n-1)`, capped at `retry_max_ms`, raised to `Retry-After`), at most `retry_attempts`
+attempts per request (defaults 6, 250 ms, 10 s; settable per store). Idempotent requests (GET, HEAD, LIST,
+DELETE, a whole-object PUT, upload part N, complete and abort) repeat on 408, 429, 500, 502, 503, 504,
+timeouts and resets; create-multipart only on 408, 429, 503 and connect errors (when B2 certainly did not
+process it). Every request body is buffered (objects up to one part in one PUT, larger ones in parts), so a
+repeat sends the same bytes; a part is repeated under its part number. A complete that is repeated after a
+lost answer and finds the upload gone checks the object (size and multipart ETag) instead of failing. An
+error in the middle of a GET body is not retried (the client sees it). Retries are logged as
+`store request failed, retrying` with the store label and operation, never the URL.
 
 ## Update a deployment
 

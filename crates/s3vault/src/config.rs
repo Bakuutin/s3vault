@@ -40,7 +40,8 @@ pub struct ServerCfg {
     /// Upload bodies up to this size are buffered in RAM; larger ones spool to encrypted local files.
     #[serde(default = "default_mem_spool")]
     pub memory_spool_max: usize,
-    /// Objects whose ciphertext exceeds this go to the store with a multipart upload.
+    /// Objects whose ciphertext exceeds this (or `store_multipart_part`, whichever is smaller) go to the
+    /// store with a multipart upload. Every request body is buffered, so failed requests can be retried.
     #[serde(default = "default_mp_threshold")]
     pub store_multipart_threshold: u64,
     #[serde(default = "default_mp_part")]
@@ -124,6 +125,17 @@ pub struct RemoteCfg {
     pub connect_timeout_secs: u64,
     #[serde(default = "default_read_timeout")]
     pub read_timeout_secs: u64,
+    /// Attempts per request (1 = no retry). Retried: throttling and transient errors (408, 429, 500, 502,
+    /// 503, 504, timeouts, resets) for idempotent requests; for the non-idempotent ones (create multipart)
+    /// only answers that guarantee the request was not processed (connect errors, 408, 429, 503).
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+    /// First backoff; doubles per attempt up to `retry_max_ms`, with jitter (a random delay between half
+    /// and all of it). A `Retry-After` from the store raises the delay (capped at `retry_max_ms`).
+    #[serde(default = "default_retry_base_ms")]
+    pub retry_base_ms: u64,
+    #[serde(default = "default_retry_max_ms")]
+    pub retry_max_ms: u64,
 }
 
 fn default_prefix() -> String {
@@ -134,6 +146,15 @@ fn default_connect_timeout() -> u64 {
 }
 fn default_read_timeout() -> u64 {
     60
+}
+fn default_retry_attempts() -> u32 {
+    6
+}
+fn default_retry_base_ms() -> u64 {
+    250
+}
+fn default_retry_max_ms() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Deserialize, Clone)]

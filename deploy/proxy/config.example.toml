@@ -30,6 +30,11 @@ bucket = "s3vault-store"
 credentials_file = "/etc/s3vault/secrets/store-local-garage.toml"
 prefix = "o/"
 read_timeout_secs = 120
+# Retries (defaults shown): exponential backoff with jitter on 408/429/500/502/503/504 and transport errors,
+# only for idempotent requests (create-multipart only on 408/429/503/connect errors). B2 answers 503 under load.
+retry_attempts = 6
+retry_base_ms = 250
+retry_max_ms = 10000
 
 # Read-through source (plain, read-only key). Used for keys the store of record does not have yet.
 [fallbacks.legacy]
