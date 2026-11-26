@@ -1,0 +1,26 @@
+[package]
+name = "s3vault-provision"
+description = "s3vault provisioner: one Backblaze B2 bucket and one bucket-scoped key per tenant, run on the key host with the account-admin key (never on the proxy)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "s3vault-provision"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+data-encoding.workspace = true
+anyhow = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/s3vault-format", "crates/s3vault", "crates/s3vault-keyd"]
+members = ["crates/s3vault-format", "crates/s3vault", "crates/s3vault-keyd", "crates/s3vault-provision"]
 
 [workspace.package]
 version = "0.1.0"
