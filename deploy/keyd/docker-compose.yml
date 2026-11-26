@@ -1,8 +1,9 @@
 # s3vault key service. Serves the master keyring only to allow-listed proxy addresses that prove the PSK.
-# Lives in its own directory (e.g. /srv/s3vault-keys/) with ./keys (root, 700; files 600).
+# Lives in its own directory (e.g. /srv/s3vault-keyd/) with ./keys (root, 700; files 600).
 #   first time:  docker compose build && docker compose run --rm init
 #   run:         docker compose up -d keyd
-# Edit LISTEN (this host's Tailscale address) and ALLOW (the proxy's Tailscale address) below.
+# Edit LISTEN (this host's private address; placeholder 100.64.0.1) and ALLOW (the proxy's address;
+# placeholder 100.64.0.2) below.
 services:
   keyd:
     build: .

@@ -1,1 +1,7 @@
 /target
+# Key material and built artifacts must never be committed.
+/deploy/keyd/bin/
+/deploy/keyd/keys/
+*.key
+*.psk
+*.secret

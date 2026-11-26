@@ -550,7 +550,7 @@ mod tests {
     fn names_are_keyed_and_flat() {
         let kr = Keyring::generate();
         let nk = kr.name_key();
-        let a = store_name(&nk, "media", "audio/1/000001.opus");
+        let a = store_name(&nk, "photos", "audio/1/000001.opus");
         let b = store_name(&nk, "other", "audio/1/000001.opus");
         assert_ne!(a, b);
         assert_eq!(a.len(), 52);
@@ -559,7 +559,7 @@ mod tests {
             a,
             store_name(
                 &Keyring::generate().name_key(),
-                "media",
+                "photos",
                 "audio/1/000001.opus"
             )
         );

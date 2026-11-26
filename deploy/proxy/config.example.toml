@@ -1,8 +1,9 @@
-# s3vault configuration (example: the deployment on host w).
+# s3vault configuration example. Addresses use placeholders: 100.64.0.2 is the proxy's private (e.g. Tailscale)
+# address, 100.64.0.1 the key service host. Bucket `app` migrates from a legacy plain store; `scratch` is new.
 # Secrets are never inline: every *_file below is a separate file, mode 600/640, root:s3vault.
 
 [server]
-# Private addresses only: loopback and the Tailscale address. Never a public IP.
+# Private addresses only: loopback and a private (e.g. Tailscale) address. Never a public IP.
 listen = ["127.0.0.1:9100", "100.64.0.2:9100"]
 admin_listen = "127.0.0.1:9101"
 data_dir = "/var/lib/s3vault"
@@ -14,13 +15,13 @@ index_snapshot_secs = 21600          # encrypted index snapshot every 6 h when i
 upload_ttl_hours = 168
 
 [keys]
-# The keyring comes from s3vault-keyd on d and is held in RAM only. Until it arrives every request is 503.
+# The keyring comes from s3vault-keyd on another host and is held in RAM only. Until it arrives every request is 503.
 source = "keyd"
 keyd_addr = "100.64.0.1:7373"
 psk_file = "/etc/s3vault/secrets/keyd.psk"
 retry_secs = 10
 
-# Store of record. Today: a local Garage on w (loopback). Later: Backblaze B2 (see vault/README.md).
+# Store of record: any S3. Here a Garage on loopback; for Backblaze B2 see README.md.
 [stores.primary]
 endpoint = "http://127.0.0.1:3910"
 region = "garage"
@@ -30,17 +31,17 @@ prefix = "o/"
 read_timeout_secs = 120
 
 # Read-through source (plain, read-only key). Used for keys the store of record does not have yet.
-[fallbacks.d-garage]
+[fallbacks.legacy]
 endpoint = "http://100.64.0.1:3900"
 region = "garage"
-credentials_file = "/etc/s3vault/secrets/fallback-d-garage.toml"
+credentials_file = "/etc/s3vault/secrets/fallback-legacy.toml"
 connect_timeout_secs = 5
 read_timeout_secs = 60
 
 [[buckets]]
-name = "media"
+name = "app"
 store = "primary"
-fallback = { source = "d-garage", bucket = "media" }
+fallback = { source = "legacy", bucket = "app" }
 
 [[buckets]]
 name = "scratch"
@@ -52,7 +53,7 @@ name = "admin-test"
 access_key_id = "SVEXAMPLEEXAMPLE"
 secret_file = "/etc/s3vault/secrets/client-admin-test.secret"
 buckets = ["scratch"]
-read_buckets = ["media"]
+read_buckets = ["app"]
 
 [fill]
 concurrency = 4

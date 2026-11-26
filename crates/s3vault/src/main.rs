@@ -127,7 +127,7 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: s3vault serve|check|rebuild|gen-client|gen-keyring ... (see the source header or vault/README.md)"
+                "usage: s3vault serve|check|rebuild|gen-client|gen-keyring ... (see README.md)"
             );
             std::process::exit(2)
         }
