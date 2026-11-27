@@ -5,3 +5,5 @@
 *.key
 *.psk
 *.secret
+__pycache__/
+*.pyc

@@ -1,12 +1,12 @@
 //! Key hierarchy commands (keystore, slots, places, baseline, drills). No network: they run in keyd's admin
-//! container on `d` or on any machine that holds a keystore copy and a slot.
+//! container on the key host or on any machine that holds a keystore copy and a slot.
 //!
 //! ```text
 //! slot-keygen --kem x25519|p256 --kind K --label L [--holder H] [--backend B] [--tenant N] --key-out F --pub-out F
 //!                                         software slot key pair (host slot file, Bitwarden recovery slot, tests)
 //! slot-pub --slot DESC --kind K --label L [--holder H] [--backend B] [--tenant N] --pub-out F
 //!                                         slot public file for a helper-held key (Secure Enclave, TPM, stand-in)
-//! slot-helper-soft pub|dh FILE            the software stand-in for a hardware helper (testenv TPM)
+//! slot-helper-soft pub|dh FILE            the software stand-in for a hardware helper (test environment TPM)
 //! kh-baseline --dir DIR [--out F]         7.2: non-secret baseline from the plain files
 //! kh-init --dir DIR --slot-pub F... --verify-slot DESC [--policy F]
 //!                                         7.3: keystore epoch 1 from the plain files (refuses a pending tenant)
@@ -69,7 +69,7 @@ fn sha_hex(s: &str) -> String {
     file_digest(s.as_bytes())
 }
 
-/// Open the newest epoch on `d`: (epoch number, file bytes, opened keystore).
+/// Open the newest epoch on the key host: (epoch number, file bytes, opened keystore).
 fn open_newest(dir: &Path, s: &dyn SlotSecret) -> (u64, Vec<u8>, Keystore) {
     let (n, b) = ks_dir(dir).read_newest().unwrap_or_else(|e| die(e));
     let ks = Keystore::open(&b, s).unwrap_or_else(|e| die(format!("epoch {n}: {e}")));

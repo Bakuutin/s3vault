@@ -211,7 +211,7 @@ pub struct FillCfg {
     /// Reconcile refuses to remove more than this fraction of the checked filled rows unless forced.
     #[serde(default = "default_reconcile_max_fraction")]
     pub reconcile_max_fraction: f64,
-    /// Key prefixes of temporary objects (for the application: `.sessions/`, `.staging/`). The fill
+    /// Key prefixes of temporary objects (for example `.sessions/`, `.staging/`). The fill
     /// never copies them and reconcile ignores them (neither counted against the cap nor removed).
     #[serde(default)]
     pub skip_prefixes: Vec<String>,

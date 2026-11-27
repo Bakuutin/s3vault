@@ -1,6 +1,6 @@
 # Erasure runbook
 
-Status: 2026-11-26. Covers decisions D1-D4 of the adversarial review: per-tenant crypto-shredding, the
+Status: Covers decisions D1-D4 of the adversarial review: per-tenant crypto-shredding, the
 erasure ledger, the replay after restores, escrow retention (30 days), store lifecycle (7 days) and the
 retention cap for forever tiers. Placeholders as in the README: `<proxy>`, `<keyhost>`, the `sva` alias for
 authenticated admin calls on the proxy, and `kd` for `cd /srv/s3vault-keyd && docker compose run --rm`
@@ -21,7 +21,7 @@ own export).
 | 5. Ledger | proxy -> key host | `ssh root@<proxy> 'sva 127.0.0.1:9101/ledger/outbox' \| ssh <keyhost> '... kd -T admin ledger-import --dir /keys'` | the proof joins the authoritative ledger |
 | 6. Escrow | owner | copy the new escrow copy (`kd -T admin escrow-cat --dir /keys`), `s3vault tenant-escrow-check`, then `kd admin tenant-escrow-confirm --digest D --place P` | the owner holds a copy without `K_t`; older copies (with it) are deleted by `escrow-prune` within 30 days |
 | 7. Follower | follower host | `s3vault ledger-replay --config C --dir <copy> --prefix o/ --ledger ledger.jsonl` | deletes the tenant's folder `o/<tag>/` in the follower copy (no key needed) |
-| 8. Application data | application | the application's own erasure (for the application: `delete-space.py`, see `per-tenant-backups.md`) | per-space databases and their backups |
+| 8. Application data | application | the application's own erasure (see `per-tenant-backups.md` for an example) | per-space databases and their backups |
 | 9. Verify after D + 1 days | proxy | `sva '127.0.0.1:9101/tenant/verify-erasure?id=<tenant id>'` | 0 objects under the tag in every store, no index partition, the proof records; on B2 also `b2 ls --versions b2://<bucket>/o/<tag>/` shows nothing |
 | 10. Verify after 30 days | key host, owner | `kd admin escrow-prune --dir /keys`; `s3vault escrow-prune --dir ~/.s3vault/tenant-escrow` | the last escrow copies issued before the erasure are deleted |
 
@@ -92,7 +92,7 @@ No tier keeps personal data without an end date:
   are either per tenant under a key derived from `K_t` (shredded with the tenant) or short-lived (days).
 - A yearly snapshot meant to be kept forever is re-written with the erased tenants removed (replay of the
   ledger) or deleted when it turns 12 months old.
-- Plaintext copies outside s3vault (for the application: the Garage fallback and the plain `s3-mirror` on `d`) are
+- Plaintext copies outside s3vault (for example a plain fallback store or a plain mirror) are
   retired once the fill is verified; until then erasure is incomplete for them and the erasure record says
   so.
 

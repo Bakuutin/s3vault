@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the s3vault recovery kit (key hierarchy 4.7, review R3): everything needed to open a keystore copy on a
-# new machine when `a` and `d` (and with them Gitea) are gone.
+# new machine when the admin workstation and the key host (and with them the git server) are gone.
 #
 #   kh-build-kit.sh OUT.tar --bin PLATFORM=DIR [--bin PLATFORM=DIR ...] [--repo DIR]
 #     PLATFORM e.g. macos-arm64, linux-x86_64, linux-arm64; DIR holds s3vault-keyd, s3vault-kh and s3vault

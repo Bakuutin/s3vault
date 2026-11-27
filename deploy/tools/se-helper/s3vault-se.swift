@@ -1,4 +1,4 @@
-// s3vault-se: the Secure Enclave slot helper for macOS (key hierarchy 3.3, the `a` device slot).
+// s3vault-se: the Secure Enclave slot helper for macOS (key hierarchy 3.3, the administrator workstation slot).
 //
 // The P-256 private key is created inside the Secure Enclave and never leaves it. The key file holds only the
 // enclave's wrapped handle (CryptoKit dataRepresentation), usable on this Mac's enclave only. It speaks the slot

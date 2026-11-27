@@ -23,7 +23,7 @@ p256 = { version = "0.13", features = ["ecdh"] }
 toml = "0.9"
 
 [features]
-# Test builds only: S3VAULT_CRASH_AT=<point> aborts at a write step (testenv crash injection).
+# Test builds only: S3VAULT_CRASH_AT=<point> aborts at a write step (test environment crash injection).
 fault-injection = []
 
 [dev-dependencies]

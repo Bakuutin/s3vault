@@ -2,8 +2,7 @@
 
 The keystore holds the data keys of s3vault (the master keyring text with the root and the legacy v1 keys, every
 tenant key `K_t`, the erasure ledger) sealed under a random master unlock key (MUK), with one random tenant unlock
-key (TUK) per tenant. Slots are HPKE public keys that wrap the MUK (master slot) or one TUK (tenant slot). Design:
-media `docs/design/S3VAULT_KEY_HIERARCHY.md`. Code: `crates/s3vault-format/src/keystore.rs`, `hpke.rs`,
+key (TUK) per tenant. Slots are HPKE public keys that wrap the MUK (master slot) or one TUK (tenant slot). Code: `crates/s3vault-format/src/keystore.rs`, `hpke.rs`,
 `slots.rs`. All integers are big-endian.
 
 ## File (one per epoch, `ks-<epoch, 10 digits>.s3vks`)
@@ -48,13 +47,13 @@ media `docs/design/S3VAULT_KEY_HIERARCHY.md`. Code: `crates/s3vault-format/src/k
 2. Open the sealed part with the MUK; read the TUK table.
 3. Open each tenant block with its TUK; put `base64(K_t[0])` in place of `@<ref>` in section 2.
 4. Sections 1, 2 (filled in) and 4 are the three files s3vault-keyd used before the keystore (`keyring`,
-   `tenants`, `ledger.jsonl`): any s3vault-keyd since 2026-11 serves them with `--source files`.
+   `tenants`, `ledger.jsonl`): any s3vault-keyd that predates the keystore serves them with `--source files`.
 
 ## Slot key files
 
 - Software key: `s3vault-slot-key v1` / `kem x25519|p256` / `sk <base64 of the 32-byte scalar>`.
 - Public file: `s3vault-slot-pub v1` / `kem` / `pk <base64>` / `kind host|device|recovery|tenant-device` /
   `label` / `holder` / `backend` / `target master|tenant <name>`.
-- Hardware helper protocol (Secure Enclave `s3vault-se`, TPM, testenv stand-in): `PROGRAM pub REF` prints
+- Hardware helper protocol (Secure Enclave `s3vault-se`, TPM, test environment stand-in): `PROGRAM pub REF` prints
   `kem <name>` and `pk <base64>`; `PROGRAM dh REF` reads one base64 line (the sender's ephemeral public key) and
   prints one base64 line (the 32-byte DH output). Descriptor: `helper:REF:PROGRAM [ARGS]`.

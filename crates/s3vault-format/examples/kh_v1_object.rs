@@ -1,4 +1,4 @@
-//! Testenv only (key hierarchy rehearsal): write a format v1 object sealed under the legacy v1 keys carried by a
+//! Test environment only (key hierarchy rehearsal): write a format v1 object sealed under the legacy v1 keys carried by a
 //! master keyring v2, as a v1 proxy would have stored it. Prints the store name (without the store prefix).
 //!   cargo run -p s3vault-format --example kh_v1_object -- MASTER_KEYRING BUCKET KEY PLAIN_FILE OUT_FILE
 use s3vault_format::keys2::MasterV2;

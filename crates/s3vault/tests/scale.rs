@@ -1,7 +1,7 @@
 //! Rebuild-at-scale drill (review H4): N synthetic index rows -> a real encrypted snapshot in an
 //! in-process S3 store -> `rebuild --snapshot` into a fresh index, with a listing synthesised from the
 //! rows (the store does not hold N objects; every listed name is older than the snapshot, so no header is
-//! read, exactly as in a real rebuild after `w` is lost). The process RSS is sampled during each phase.
+//! read, exactly as in a real rebuild after the proxy host is lost). The process RSS is sampled during each phase.
 //!
 //! `S3VAULT_SCALE_ROWS` sets N (default 50 000, a few seconds). The production-size drill:
 //! `S3VAULT_SCALE_ROWS=8700000 cargo test --release -p s3vault --test scale -- --nocapture`.

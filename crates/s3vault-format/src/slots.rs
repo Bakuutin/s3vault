@@ -16,13 +16,13 @@
 //!
 //! The private half is opened through a **slot descriptor**:
 //!
-//! * `file:PATH`: a software slot key file (`s3vault-slot-key v1`, `kem`, `sk <base64>`), mode 600. The `d`
-//!   host slot during the migration, the Bitwarden recovery slot (the file is a block in the note), tests.
+//! * `file:PATH`: a software slot key file (`s3vault-slot-key v1`, `kem`, `sk <base64>`), mode 600. The key host
+//!   slot during the migration, the Bitwarden recovery slot (the file is a block in the note), tests.
 //! * `helper:REF:PROGRAM [ARGS...]`: a helper program in front of hardware that keeps the private key. The
 //!   protocol is `PROGRAM ARGS pub REF` (stdout `kem <name>` and `pk <base64>`) and `PROGRAM ARGS dh REF` (stdin
 //!   one base64 line, the sender's ephemeral public key; stdout one base64 line, the DH output). The Secure
 //!   Enclave helper on macOS (`s3vault-se`), a TPM helper on Linux, and the software stand-in
-//!   `s3vault-keyd slot-helper-soft` (testenv) all speak it, so the keystore code is the same on every
+//!   `s3vault-keyd slot-helper-soft` (test environment) all speak it, so the keystore code is the same on every
 //!   platform (principle 2).
 
 use crate::hpke::{Kem, SlotSecret, SoftSecret};
@@ -163,7 +163,7 @@ pub fn parse_soft_key(text: &str) -> Result<SoftSecret> {
     SoftSecret::from_bytes(kem.ok_or_else(|| serr("missing kem"))?, &sk.ok_or_else(|| serr("missing sk"))?)
 }
 
-/// A slot secret behind a helper program (Secure Enclave, TPM, or the testenv stand-in).
+/// A slot secret behind a helper program (Secure Enclave, TPM, or the test environment stand-in).
 pub struct HelperSecret {
     program: Vec<String>,
     reference: String,
@@ -253,7 +253,7 @@ pub fn expand_home(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// The software stand-in for a hardware helper (testenv TPM stand-in): `pub FILE` and `dh FILE` over a
+/// The software stand-in for a hardware helper (test environment TPM stand-in): `pub FILE` and `dh FILE` over a
 /// software slot key file. Returns the text to print on stdout.
 pub fn soft_helper(verb: &str, file: &Path, stdin: &str) -> Result<Zeroizing<String>> {
     let text = Zeroizing::new(std::fs::read_to_string(file).map_err(|e| serr(format!("read {}: {e}", file.display())))?);
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn soft_helper_stands_in_for_hardware() {
-        // the helper protocol through the software stand-in, as the TPM stand-in in testenv uses it
+        // the helper protocol through the software stand-in, as the TPM stand-in in test environment uses it
         let sk = SoftSecret::generate(Kem::P256);
         let d = std::env::temp_dir().join(format!("sh-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&d).unwrap();

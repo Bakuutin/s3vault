@@ -1,8 +1,7 @@
 # Provisioning: one Backblaze B2 bucket and one scoped key per tenant
 
-Status: 2026-11-26. Design, tool (`s3vault-provision`, crate `crates/s3vault-provision`) and the first
-two buckets. Placeholders as in the README: `<proxy>` the proxy host, `<keyhost>` the key service host.
-In the the application deployment the proxy is `w`, the key host is `d`, and the owner's Mac is `a`.
+Design and tool (`s3vault-provision`, crate `crates/s3vault-provision`). Placeholders as in the README:
+`<proxy>` the proxy host, `<keyhost>` the key service host, `<admin>` the administrator's workstation.
 
 ## 1. Constraint
 
@@ -39,7 +38,7 @@ credentials_file = "/etc/s3vault/secrets/store-owner.toml"
 prefix = "o/"
 
 [[buckets]]
-name = "media"
+name = "app"
 store = "t-owner"
 tenant = "owner"
 ```
@@ -57,7 +56,7 @@ tenant = "owner"
 So per-tenant buckets add no metadata leak beyond the tag, which the per-tenant backups already
 required, and they make erasure and key compromise strictly smaller.
 
-**The 100-bucket limit.** The account holds 4 buckets on 2026-11-26 (2 restic, 2 s3vault). The tool
+**The 100-bucket limit.** Backblaze limits an account to 100 buckets. The tool
 refuses to create a bucket when the account has `--max-buckets` (default 100) or more. Plan: per-tenant
 buckets up to about 90; before that, ask Backblaze sales for a higher limit (cheap, no design change).
 If refused: small tenants share one **overflow** bucket (a store `shared`, the tag separates them, erasure
@@ -93,17 +92,17 @@ never goes to the proxy. Choice of host:
 
 - **Key host (chosen).** It already holds the keyrings (s3vault-keyd), so its compromise already exposes
   every tenant; the provisioning key adds account administration (deleting buckets), not readability. It
-  is where tenants are created (`tenant-create`), so one host runs both steps. In the the application deployment
-  `d` also holds restic's account-wide B2 key, so the new key adds no new exposure there.
-- The owner's Mac (an admin CLI there) was the alternative: the laptop travels and sleeps, and it would
+  is where tenants are created (`tenant-create`), so one host runs both steps. If that host already holds
+  another account-wide B2 key (for example a backup tool's), the new key adds no new exposure there.
+- The administrator's workstation (an admin CLI there) was the alternative: the laptop travels and sleeps, and it would
   need the B2 admin key on it as well. It keeps only the tenant keys' copy and the record of where the
   provisioning key is.
 - The proxy: never (its RAM and disk are visible to the VPS provider).
 
-The provisioning key was minted once from restic's key (2026-11-26) so that restic's key is not used by
-s3vault again. Owner follow-up (recommended): restrict restic to its own buckets with a fresh key that has
-no `writeKeys`, then delete the old all-capability key; and keep the account's master application key
-offline.
+Mint the provisioning key once from an existing account key, so that the existing key (for example a backup
+tool's) is not used by s3vault again. Recommended follow-up: restrict that tool to its own buckets with a
+fresh key that has no `writeKeys`, then delete the old all-capability key; and keep the account's master
+application key offline.
 
 ## 5. Flow
 
@@ -176,32 +175,29 @@ anything, state file mode 600, duplicate and invalid tenants refused, bucket lim
 rotate and revoke, retire (including a stray key), deprovision with and without purge, re-provisioning a
 deleted name, sealing and opening with `openssl`, uniform random names.
 
-## 8. The application deployment (2026-11-26)
+## 8. Example deployment
 
 | What | Where |
 |---|---|
-| `s3vault-provision` binary | `d`: `/srv/s3vault-provision/bin/s3vault-provision` (built in `rust:1.99-slim-bookworm`, glibc 2.34+) |
-| Provisioning key (`ADMIN_CAPS`, not bucket-restricted, random name) | `d`: `/srv/s3vault-provision/b2-admin.env` (admin, 600; dir 700, like restic's `/srv/restic/b2.env`) |
-| State (tenant to bucket) | `d`: `/srv/s3vault-provision/state.json` (600) |
-| Tenant `owner` | bucket `<bucket-id>`, one scoped key |
-| Tenant `system` (for PBM; moving PBM off `owner` is an open owner decision) | bucket `<bucket-id>`, one scoped key |
-| Copy of both tenant keys, endpoint, region | `a`: `~/.s3vault-admin/b2-s3vault.env` (600); records the provisioning key's location, not its value |
+| `s3vault-provision` binary | `<keyhost>`: `/srv/s3vault-provision/bin/s3vault-provision` (built in a `rust:slim-bookworm` container, glibc 2.34+) |
+| Provisioning key (`ADMIN_CAPS`, not bucket-restricted, random name) | `<keyhost>`: `/srv/s3vault-provision/b2-admin.env` (service user, mode 600; directory 700) |
+| State (tenant to bucket) | `<keyhost>`: `/srv/s3vault-provision/state.json` (600) |
+| Tenant `owner` | one private bucket, one scoped key |
+| Tenant `system` | one private bucket, one scoped key |
+| Copy of the tenant keys, endpoint, region | `<admin>`: `~/.s3vault-admin/b2-s3vault.env` (600); records the provisioning key's location, not its value |
 
-Region `eu-central-003`, S3 endpoint `https://s3.eu-central-003.backblazeb2.com`. Verified: each scoped
-key authorizes with exactly its own bucket and `SCOPED_CAPS` (no `writeKeys`); S3 PUT, GET (SHA-256 equal),
-LIST and DELETE (by version id, nothing left) in its own bucket; PUT, GET and LIST on the other tenant's
-bucket answer 403. `list` shows both buckets private, lifecycle D2, object lock off.
+Verified: each scoped key authorizes with exactly its own bucket and `SCOPED_CAPS` (no `writeKeys`); S3 PUT,
+GET (SHA-256 equal), LIST and DELETE (by version id, nothing left) in its own bucket; PUT, GET and LIST on the
+other tenant's bucket answer 403. `list` shows the buckets private, lifecycle D2, object lock off.
 
-**ST1 step 1, 2026-11-26:** `w`'s recipient key made (`/etc/s3vault/secrets/provision-recipient.key`), a second
-`owner` key (…0006) minted with `rotate-key --recipient` and opened straight into `store-owner.toml` on `w`;
-`[stores.t-owner]` serves `media` and `pbm`; the owner's 1,206 objects copied as-is from the stand-in (`deploy/tools/
-s3sum.py --pull-to`, then `--push-from --skip-existing`, which retried a B2 500), SHA-256 identical. Old key …0004
-(the Mac's copy) still valid: `revoke-old-keys` is the owner's call. `scratch` stays on the stand-in.
+Bringing a tenant onto its own bucket, in order:
 
-What the ST1 switch needs next (in order): Backblaze's DPA signed (D5); bounded retries with jitter on B2
-500/503 (review M4) before any load; the proxy's recipient key (section 5), and the `owner` key installed on
-`w` as `store-owner.toml` (sealed: `rotate-key --recipient`, then `revoke-old-keys`, which also retires the
-copy on the Mac; or piped from the Mac's copy); `[stores.t-owner]` with buckets `media` (and, while PBM
-stays on `owner`, `pbm`) pointed at it; copy `o/<owner tag>/` from the Garage stand-in, restart, `/status`
-and `POST /verify`; `scratch` stays on the stand-in or gets its own bucket. Then the full fill (owner
-go-ahead).
+1. Sign the storage provider's data processing agreement (`docs/gdpr/processor-agreements.md`).
+2. Make the proxy's recipient key (section 5) and mint a second tenant key with `rotate-key --recipient`; open
+   it straight into `store-<tenant>.toml` on `<proxy>`.
+3. Point `[stores.t-<tenant>]` and the tenant's buckets at it.
+4. Copy the tenant's objects from the old store as-is (`deploy/tools/s3sum.py --pull-to`, then `--push-from
+   --skip-existing`; both retry transient 500/503 answers) and compare SHA-256 sums.
+5. Restart the proxy, check `/status` and `POST /verify`.
+6. Retire the old key with `revoke-old-keys`, which also removes the copy on the workstation.
+7. Run the full fill from the fallback, if there is one.

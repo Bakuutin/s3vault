@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Bitwarden escrow place of the s3vault key hierarchy (KH6, KH12, KH15), run on the owner's device `a`.
+# The Bitwarden escrow place of the s3vault key hierarchy (KH6, KH12, KH15), run on the administrator's workstation.
 # Files go INSIDE secure-note text as delimited blocks (bw-note-blocks.sh: no attachments, those need Premium).
 #
 # Items (Bitwarden caps a note at 10,000 characters after encryption, so the keystore has its own item):
@@ -20,7 +20,8 @@
 #   kh-bitwarden-place.sh status                     item names, block names and sizes (no content)
 #
 # Environment: BW (bw binary, default `bw`; tests point it at a fake), BW_SESSION (if set, the Keychain is not
-# touched), KH_BW_PREFIX (item name prefix, default "s3vault"). Nothing is printed but names, sizes and
+# touched), KH_BW_PREFIX (item name prefix, default "s3vault"), KH_BW_MARKER (note block marker, default "S3VAULT"),
+# KH_BW_KEYCHAIN_ITEM (Keychain item for the session, default "s3vault-bw-session"). Nothing is printed but names, sizes and
 # digests; bw never prompts (BW_NOINTERACTION).
 set -euo pipefail
 
@@ -28,7 +29,8 @@ BWBIN=${BW:-bw}
 PREFIX=${KH_BW_PREFIX:-s3vault}
 KS_ITEM="$PREFIX keystore"
 REC_ITEM="$PREFIX recovery"
-KC_ITEM=s3vault-bw-session
+KC_ITEM=${KH_BW_KEYCHAIN_ITEM:-s3vault-bw-session}
+MARK=${KH_BW_MARKER:-S3VAULT}   # block marker inside the notes; keep the value used when the items were written
 export BW_NOINTERACTION=true
 
 die() { printf 'kh-bitwarden-place: %s\n' "$*" >&2; exit 1; }
@@ -97,9 +99,9 @@ put_keystore() {
       k=$((k + 1))
       { printf 's3vault keystore copy: epoch %s sha256 %s, part %s of %s, stored %s\n' "$epoch" "$sha" "$k" "$parts" "$(date -u '+%Y-%m-%d %H:%M UTC')"
         printf 'Restore: join the base64 lines of every part in order, base64 -d > keystore.s3vks, check the sha256.\n'
-        bwn_begin "S3VAULT KEYSTORE" "keystore.s3vks.part$k"; printf '\n'
+        bwn_begin "$MARK KEYSTORE" "keystore.s3vks.part$k"; printf '\n'
         fold -w 64 < "$p"; printf '\n'
-        bwn_end "S3VAULT KEYSTORE" "keystore.s3vks.part$k"; printf '\n'
+        bwn_end "$MARK KEYSTORE" "keystore.s3vks.part$k"; printf '\n'
       } > "$TMP/note.$k"
       fits "$TMP/note.$k" || ok=0
     done
@@ -142,9 +144,9 @@ get_epoch() {   # epoch out
     id=$(awk -F'\t' -v e="$e" -v k="$k" '$2 == e && $3 == k {print $1; exit}' "$TMP/items.$e")
     [ -n "$id" ] || return 1
     notes_of "$id" > "$TMP/n.$k"
-    grep -qxF -e "$(bwn_begin "S3VAULT KEYSTORE" "keystore.s3vks.part$k")" "$TMP/n.$k" || return 1
-    awk -v b="$(bwn_begin "S3VAULT KEYSTORE" "keystore.s3vks.part$k")" \
-        -v e="$(bwn_end "S3VAULT KEYSTORE" "keystore.s3vks.part$k")" -v m=base64 "$BWN_AWK" < "$TMP/n.$k" \
+    grep -qxF -e "$(bwn_begin "$MARK KEYSTORE" "keystore.s3vks.part$k")" "$TMP/n.$k" || return 1
+    awk -v b="$(bwn_begin "$MARK KEYSTORE" "keystore.s3vks.part$k")" \
+        -v e="$(bwn_end "$MARK KEYSTORE" "keystore.s3vks.part$k")" -v m=base64 "$BWN_AWK" < "$TMP/n.$k" \
       | tr -d '\n' >> "$TMP/joined"
   done
   (umask 077; base64 -d < "$TMP/joined" > "$out") || return 1
@@ -171,9 +173,9 @@ put_block() {   # name file: replace that block in the recovery item
   id=$(item_id "$REC_ITEM")
   if [ -n "$id" ]; then notes_of "$id" > "$TMP/cur"; else printf 's3vault recovery item (key hierarchy 4.7)\n' > "$TMP/cur"; fi
   # drop the old block of this name, append the new one
-  awk -v b="$(bwn_begin "S3VAULT" "$name")" -v e="$(bwn_end "S3VAULT" "$name")" \
+  awk -v b="$(bwn_begin "$MARK" "$name")" -v e="$(bwn_end "$MARK" "$name")" \
     '{sub(/\r$/, "")} $0 == b {skip = 1} !skip {print} $0 == e {skip = 0}' "$TMP/cur" > "$TMP/new"
-  { printf '%s (%s, sha256 %s)\n' "$name" "$mode" "$(sha256 "$f")"; bwn_block "S3VAULT" "$name" "$f" "$mode"; } >> "$TMP/new"
+  { printf '%s (%s, sha256 %s)\n' "$name" "$mode" "$(sha256 "$f")"; bwn_block "$MARK" "$name" "$f" "$mode"; } >> "$TMP/new"
   fits "$TMP/new" || die "the recovery item would exceed the note limit"
   if [ -n "$id" ]; then edit_notes "$id" "$TMP/new"; else create_item "$REC_ITEM" "$TMP/new" >/dev/null; fi
   bw sync >/dev/null 2>&1 || true
@@ -189,7 +191,7 @@ get_block() {   # name out [mode]
   notes_of "$id" > "$TMP/rec"
   [ -n "$mode" ] || mode=$(awk -v n="$name" 'index($0, n " (") == 1 {sub(/^[^(]*\(/, ""); sub(/,.*/, ""); m=$0} END {print m}' "$TMP/rec")
   [ -n "$mode" ] || die "no block $name"
-  (umask 077; bwn_extract "S3VAULT" "$name" "$mode" "$out" < "$TMP/rec")
+  (umask 077; bwn_extract "$MARK" "$name" "$mode" "$out" < "$TMP/rec")
   [ -s "$out" ] || die "block $name is empty"
 }
 
@@ -200,7 +202,7 @@ case "${1:-}" in
   get-block) get_block "${2:?name}" "${3:?out}"; printf 'restored %s\n' "$2" ;;
   status)
     ks_items | awk -F'\t' '{print "keystore epoch " $2 " part " $3 " of " $4}' 
-    id=$(item_id "$REC_ITEM"); [ -n "$id" ] && { echo "$REC_ITEM:"; notes_of "$id" | bwn_names "S3VAULT" | sed 's/^/  /'; }
+    id=$(item_id "$REC_ITEM"); [ -n "$id" ] && { echo "$REC_ITEM:"; notes_of "$id" | bwn_names "$MARK" | sed 's/^/  /'; }
     true ;;
   *) sed -n '2,25p' "$0"; exit 2 ;;
 esac

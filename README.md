@@ -24,7 +24,7 @@ client --S3 (private net/loopback)--> s3vault (proxy host) --TLS--> store of rec
 
 The commands below use placeholders: `<proxy>` is the proxy host (reached as `root@<proxy>`), `<keyhost>` the
 key service host, `/srv/s3vault-keyd` the key service directory there, and `~/.s3vault/master.key` the
-owner's offline keyring backup. A real deployment is described in [Example deployment](#example-deployment-media).
+administrator's offline keyring backup. A typical layout is described in [Example deployment](#example-deployment).
 
 ## What the store of record sees
 
@@ -89,7 +89,7 @@ docker compose run --rm fingerprint   # non-secret fingerprint, escrow state, te
 Then escrow the master keyring (the proxy refuses an unescrowed root) and create the tenants, as in
 [Keys and tenants](#keys-and-tenants).
 
-Copy the PSK to the proxy and the keyring to the owner's Mac without printing them:
+Copy the PSK to the proxy and the keyring to the administrator's workstation without printing them:
 
 ```sh
 ssh <keyhost> 'docker run --rm --network none -v /srv/s3vault-keyd/keys:/k:ro alpine cat /k/psk' \
@@ -193,11 +193,11 @@ chgrp s3vault /etc/s3vault/secrets/client-NAME.secret; chmod 640 /etc/s3vault/se
 Add a `[[clients]]` block with `buckets` (read-write) and/or `read_buckets` (read-only), then
 `systemctl restart s3vault`. Clients use path-style addressing, region `us-east-1`, endpoint
 `http://<proxy>:9100` (its private name or address). s3vault hands out no presigned URLs, but it **accepts
-query-string-signed requests** (SigV4 presigned form) from its clients: some clients sign every request that way (the
-the application's `rusty-s3`; refusing them was tried and breaks those clients). Whoever holds a client key can therefore
+query-string-signed requests** (SigV4 presigned form) from its clients: some clients sign every request that way (for
+example `rusty-s3`; refusing them breaks those clients). Whoever holds a client key can therefore
 mint a URL that works until it expires; that is one more reason the listeners stay on loopback and private
-addresses. A client that must not hand out such URLs decides that itself (the the application records `presign: false`
-for an endpoint on its private allow-list).
+addresses. A client that must not hand out such URLs decides that itself (for example by never generating presigned URLs for
+endpoints on its private allow-list).
 
 ## Fill from the fallback
 
@@ -233,7 +233,7 @@ Guards (a reconcile against an empty or unreachable fallback would otherwise dro
 - a real run needs `expect` equal to the dry run's `stale` (so a dry run always comes first), and is refused
   when it would remove more than `fill.reconcile_max_fraction` (default 0.01) of the checked filled rows,
   unless `force=1` is added after checking the fallback;
-- keys under `fill.skip_prefixes` (temporary objects, for the application `.sessions/` and `.staging/`)
+- keys under `fill.skip_prefixes` (temporary objects, for example `.sessions/` and `.staging/`)
   are ignored: not checked, not counted against the cap, not removed (reported as `skipped_temp`). The fill
   never copies them either (`session_skipped_temp` in `/fill`).
 
@@ -442,14 +442,14 @@ The proxy builds from a clone of this repository in `/opt/s3vault/src`, using a 
 `/root/.ssh/config`:
 
 ```
-Host gitea-s3vault
+Host git-s3vault
     HostName git.example.com
     User git
     IdentityFile /root/.ssh/s3vault_deploy
     IdentitiesOnly yes
 ```
 
-First time: `git clone gitea-s3vault:<owner>/s3vault.git /opt/s3vault/src`. Each update, as root on the proxy:
+First time: `git clone git-s3vault:<owner>/s3vault.git /opt/s3vault/src`. Each update, as root on the proxy:
 
 ```sh
 cd /opt/s3vault/src
@@ -489,26 +489,21 @@ above. A unit file change (`deploy/proxy/s3vault.service`) is installed separate
   store returned another object). Logged as `integrity:`; never served.
 - Logs: `journalctl -u s3vault`. Key material is never logged.
 
-## Example deployment (the application)
+## Example deployment
 
-The first deployment protects the audio store of the application (a personal audio and transcription platform).
+A typical small deployment (hosts are placeholders):
 
 | What | Host | Details |
 |---|---|---|
-| `s3vault.service` | `w` | `/usr/local/bin/s3vault` (previous binary `/usr/local/bin/s3vault.prev`), `/etc/s3vault/config.toml`, `/etc/s3vault/secrets/`, `/var/lib/s3vault/`, source `/opt/s3vault/src` |
-| S3 listeners | `w` | `127.0.0.1:9100`, `100.64.0.2:9100` (Tailscale); firewalld zone `tailnet` (tailscale0) allows only ssh and 9100/tcp |
-| Store of record, tenant `owner` | B2 | since 2026-11-26 18:57 UTC: store `t-owner`, its own bucket in `eu-central-003`, key `/etc/s3vault/secrets/store-owner.toml` (sealed `rotate-key`); buckets `media` and `pbm`. Copied as-is from the stand-in (1,206 objects, SHA-256 identical), `POST /verify` clean. Rollback: `/etc/s3vault/config.toml.pre-st1-20261126` (the stand-in keeps the owner's objects as of 18:36 UTC) |
-| Store of record, `scratch` (stand-in) | `w` | Garage, Podman quadlet `s3vault-garage.service` (`/etc/containers/systemd/s3vault-garage.container`, `/etc/s3vault-garage/garage.toml`, `/var/lib/s3vault-garage/`), S3 on `127.0.0.1:3910`, bucket `s3vault-store` |
-| Fallback `d-garage` | `d` | the application's plain Garage, `100.64.0.1:3900`, bucket `media` (8.79M objects, 862 GB on 2026-11-26; a full fill needs the owner's go-ahead), read with the dedicated read-only Garage key `s3vault-fallback-ro` (read on `media` only; `/etc/s3vault/secrets/fallback-d-garage-ro.toml`, since 2026-11-26). Fill defaults concurrency 16 at 2.4 MB/s (`d` to `w` measured 2.7-3.2 MB/s) |
-| `s3vault-keyd` | `d` | `/srv/s3vault-keys/` (`keys/`: master keyring v2, tenants, ledger, `escrow/`; `backups/keys-<date>.tar` taken before each key-service change; `bin/s3vault-keyd.prev`), listens `100.64.0.1:7373`, allows `100.64.0.2` only; daily `escrow-prune` from admin's crontab (03:23, log `escrow-prune.log`) |
-| Master keyring backup | owner's Mac | `~/.s3vault-admin/vault-master.v2.key` (master v2, fingerprint `<fingerprint>`, escrowed as `owner-mac`; carries the legacy v1 keys). The v1 file `~/.s3vault-admin/vault-master.key` is now only needed for the v1 legacy keys, which the v2 file also holds. A second offline copy is an owner step |
-| B2 provisioning | `d`, owner's Mac | `d`: `/srv/s3vault-provision/` (provisioning key, state, binary, `w-recipient.pub`). B2 region `eu-central-003`: tenant `owner` bucket `<bucket-id>` (keys …0004, copy on the Mac, and …0006, on `w` only), tenant `system` bucket `<bucket-id>` (one key, not used yet); a copy of the first scoped keys in `~/.s3vault-admin/b2-s3vault.env` on the Mac. `revoke-old-keys --tenant owner` (retiring …0004 and the Mac copy) is the owner's call |
-| Tenant keyring escrow | owner's Mac | `~/.s3vault-admin/tenant-escrow/tenants-<issued>.sealed` (prune with `s3vault escrow-prune --dir ~/.s3vault-admin/tenant-escrow --max-age-days 30`; scheduling it on the Mac is an owner step) |
+| `s3vault.service` | `<proxy>` | `/usr/local/bin/s3vault` (previous binary `/usr/local/bin/s3vault.prev`), `/etc/s3vault/config.toml`, `/etc/s3vault/secrets/`, `/var/lib/s3vault/`, source `/opt/s3vault/src` |
+| S3 listeners | `<proxy>` | `127.0.0.1:9100` and the private address (for example a VPN) on 9100; the firewall allows only ssh and 9100/tcp on the private interface |
+| Store of record, one tenant | B2 | store `t-<tenant>`: its own bucket, key in `/etc/s3vault/secrets/store-<tenant>.toml` (sealed with `rotate-key`) |
+| Store of record for a scratch tenant | `<proxy>` | a local Garage or MinIO, S3 on `127.0.0.1` |
+| Fallback | `<keyhost>` | the old plain store, read with a dedicated read-only key (read on the one bucket only; `/etc/s3vault/secrets/fallback-ro.toml`) |
+| `s3vault-keyd` | `<keyhost>` | `/srv/s3vault-keyd/` (`keys/`: master keyring, tenants, ledger, `escrow/`; `backups/keys-<date>.tar` taken before each key-service change; `bin/s3vault-keyd.prev`), listens on the private address, allows the proxy's address only; daily `escrow-prune` from cron |
+| Master keyring backup | `<admin>` | `~/.s3vault/master.key`, escrowed; a second offline copy is kept elsewhere |
+| B2 provisioning | `<keyhost>`, `<admin>` | `<keyhost>`: `/srv/s3vault-provision/` (provisioning key, state, binary, recipient public key); a copy of the scoped tenant keys on `<admin>` |
+| Tenant keyring escrow | `<admin>` | `~/.s3vault/tenant-escrow/tenants-<issued>.sealed` (prune with `s3vault escrow-prune --dir ~/.s3vault/tenant-escrow --max-age-days 30`) |
 
-Tenants: `owner` (bucket `media`, fallback `d-garage`/`media`), `scratch` (bucket `scratch`); `drill` was
-created and erased on 2026-11-26 as the live erasure drill (ledger entries 1-2). Clients: the test
-client `admin-test` (read-write `scratch` and `drill`, read-only `media`), `pbm` (read-write `pbm`) and, since
-2026-11-26, `core` (read-write `media`) for the the application, unused until its home space is switched (ST1-b,
-owner go-ahead; runbook `ST1B_SWITCH.md` in the ops repo). The ~1,000 trial objects were migrated to format v2 (`migrate-v2`, then `--delete-v1`);
-the v1 index is kept as `/var/lib/s3vault/index.v1.db`. Hardening on `w`: swap off (fstab entry
-commented, `swap.target` masked), `kernel.core_pattern=|/bin/false`.
+Hardening on the proxy host: swap off (fstab entry commented, `swap.target` masked),
+`kernel.core_pattern=|/bin/false`.

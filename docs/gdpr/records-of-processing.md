@@ -1,8 +1,8 @@
 # Records of processing activities (GDPR Art. 30): template
 
-Status: draft template, 2026-11-26. Not legal advice; the controller fills it in and has it reviewed.
-Generic for any deployment of s3vault; the example column uses the application (a personal audio and
-transcription platform that hosts several users and records third parties), for which the owner decided
+Status: draft template. Not legal advice; the controller fills it in and has it reviewed.
+Generic for any deployment of s3vault; the example column uses a hypothetical audio and
+transcription platform that hosts several users and records third parties, for which the operator decided
 that the GDPR applies.
 
 Keep one record per processing activity. Update it when a purpose, a category of data, a recipient, a
@@ -10,10 +10,10 @@ storage location or a retention period changes, and keep the old versions.
 
 ## 1. Controller
 
-| Field | To fill | Example (the application) |
+| Field | To fill | Example (audio platform) |
 |---|---|---|
-| Controller (name, address, contact) | | The owner of the deployment, as a natural person or a business |
-| Representative in the EU (Art. 27, if established outside the EU) | | not needed if the owner is in the EU |
+| Controller (name, address, contact) | | The operator of the deployment, as a natural person or a business |
+| Representative in the EU (Art. 27, if established outside the EU) | | not needed if the operator is in the EU |
 | Data protection officer (Art. 37, if required) | | usually not required for a small deployment; record the reasoning |
 | Joint controllers (Art. 26) | | a space owner who invites others may be a joint controller for that space: decide and record |
 
@@ -44,7 +44,7 @@ Copy this table per activity.
 | Transcripts, summaries | with the audio | per-space database backups: deleted with the space | encrypted under the tenant key | none |
 | Voice embeddings, speaker labels | with the speaker profile; deleted when the person objects or withdraws consent | as transcripts | as transcripts | none |
 | Account and membership rows | while the account exists | system database backups | | **cap: 12 months** for any tier that holds identity rows, plus redaction by the erasure ledger at restore |
-| Erasure ledger and proof records | forever (opaque ids only, no personal data) | with the key service | with the owner | allowed: holds no personal data |
+| Erasure ledger and proof records | forever (opaque ids only, no personal data) | with the key service | with the operator | allowed: holds no personal data |
 | Tenant-key escrow copies | n/a | at most 30 days (R_tk) | at most 30 days | none |
 
 **Retention cap for personal data in forever tiers (decision D4).** No backup tier may keep personal data

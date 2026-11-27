@@ -1,8 +1,8 @@
 # Data protection impact assessment (GDPR Art. 35): outline
 
-Status: draft outline, 2026-11-26. Not legal advice. The controller completes it, consults the people
+Status: draft outline. Not legal advice. The controller completes it, consults the people
 concerned where practical, and records the decision. Generic for systems that record audio continuously;
-the application (continuous household audio, transcription, speaker identification, hosted users) is the example.
+A hypothetical platform with continuous household audio, transcription, speaker identification and hosted users is the example.
 
 ## 0. Why a DPIA is required here
 
@@ -49,7 +49,7 @@ For each risk: likelihood, severity, existing measures, residual risk.
 | Data kept longer than stated | backups, follower copies, forever tiers | mitigated by per-tenant keys, escrow limit, ledger replay |
 | Erased data reappearing after a restore | backups restored without the ledger | mitigated by the ledger replay in every restore path |
 | Loss of data (availability) | lost keys, provider failure | two offline root copies, escrow before rotation |
-| Metadata leakage to the store provider | object sizes and timing reveal speech activity | accepted by the owner; documented in the threat model |
+| Metadata leakage to the store provider | object sizes and timing reveal speech activity | accepted by the operator; documented in the threat model |
 | Inaccurate transcripts or attributions | ASR and diarization errors | rectification path; no decisions based on them |
 
 ## 4. Measures

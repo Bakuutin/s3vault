@@ -1,9 +1,9 @@
 # Per-tenant backups: design
 
-Status: design, 2026-11-26. Owner decision on D1: every backup tier is kept **per tenant** and encrypted
+Status: design. Decision (D1): every backup tier is kept **per tenant** and encrypted
 under that tenant's key, so one tenant's backups can be restored, exported or erased alone, and destroying
 the tenant secret shreds all of them at once. The s3vault part is built (format v2); the application part
-(the application's per-space Mongo databases) is a design only: the application changes come later.
+(an application with one MongoDB database per space) is a design only.
 
 ## 1. Tiers produced by s3vault (built)
 
@@ -25,15 +25,15 @@ What the store learns from the per-tenant layout: which objects belong to the sa
 each tenant's object count, sizes and write cadence. That is the price of per-tenant restore and purge by
 prefix; names, keys, contents and the tenant's identity stay hidden.
 
-## 2. The application: per-space Mongo databases (design only)
+## 2. Application example: per-space MongoDB databases (design only)
 
-Today (`MULTI_USER.md` 4.10, `BACKUPS_MONGO_GARAGE.md`): every space has its own Mongo database; Percona
-Backup for MongoDB (PBM) makes full PITR bases plus oplog for the whole replica set, and per-space
-snapshots; `app_sys` (users, memberships, access log, storage secrets) has a yearly tier kept forever.
+Assumed setup: every space has its own Mongo database; Percona Backup for MongoDB (PBM) makes full PITR
+bases plus oplog for the whole replica set, and per-space snapshots; a system database `app_sys` (users,
+memberships, access log, storage secrets) has a yearly tier kept forever.
 
 ### 2.1 Tenant = space
 
-- One s3vault tenant per space, created by the core's space provisioner together with the space's bucket
+- One s3vault tenant per space, created by the application's space provisioner together with the space's bucket
   (`tenant-create`, escrow confirmation, then the bucket). A user's personal space is a tenant like any
   other; `app_sys` is the system, not a tenant.
 - The space document stores the tenant **name** and **id** (opaque), never `K_t`.
@@ -43,7 +43,7 @@ snapshots; `app_sys` (users, memberships, access log, storage secrets) has a yea
 - A per-space logical backup (`mongodump --db <space db> --archive --gzip`, or a PBM selective backup of
   that database) is written **through s3vault** into a per-space backup bucket
   (`app-b-<space>`, tenant = the space's tenant). s3vault encrypts it under `K_t` like any object, so
-  the archive is shredded with the space, its B2 versions included, with no extra key handling in the core.
+  the archive is shredded with the space, its B2 versions included, with no extra key handling in the application.
 - Alternative when PBM must write directly: encrypt each archive with a key derived from `K_t`
   (`HKDF(K_t, "app/backup" || space id)`) obtained from the proxy through an authenticated admin call
   that returns only that derived key; the archive goes to the store under the tenant's prefix. More moving
@@ -51,7 +51,7 @@ snapshots; `app_sys` (users, memberships, access log, storage secrets) has a yea
 - Schedule per space (for example daily, 30 dailies plus 12 monthlies), so a space's retention can differ
   from the system's.
 - **Restore of one space**: read its archives through s3vault (`mongorestore --nsInclude '<space db>.*'`),
-  replay the ledger (section 2.4), then run the core's dangling-reference check against the space's bucket
+  replay the ledger (section 2.4), then run the application's dangling-reference check against the space's bucket
   (`s3vault rebuild --tenant` first if the space's objects were restored too).
 
 ### 2.3 Shared tiers that cannot be per tenant
@@ -61,32 +61,32 @@ snapshots; `app_sys` (users, memberships, access log, storage secrets) has a yea
   under a key with the same short life. A space erasure then ends in those tiers within 2 days, which the
   proof record states.
 - **`app_sys`** holds identities. Its forever tier is replaced by a **12-month cap** (D4); a yearly
-  snapshot that must be kept longer is re-written with the ledger's erased users removed, or the household
-  exemption is decided explicitly (it no longer applies: the owner decided the GDPR applies).
+  snapshot that must be kept longer is re-written with the ledger's erased users removed, or an exemption
+  (for example the household exemption) is decided explicitly and recorded.
 
 ### 2.4 The ledger in the application
 
-- The core reads the s3vault erasure ledger (key service copy, or the proxy's `GET /ledger`) and keeps a
+- The application reads the s3vault erasure ledger (key service copy, or the proxy's `GET /ledger`) and keeps a
   copy in `app_sys` **and** next to the key service, so restoring `app_sys` cannot roll its own
   ledger back.
-- The core adds its own entries through the same outbox mechanism: user ids (opaque) and per-chunk
-  deletions inside the backup windows (`object-erased` entries come from s3vault already when the core
+- The application adds its own entries through the same outbox mechanism: user ids (opaque) and per-chunk
+  deletions inside the backup windows (`object-erased` entries come from s3vault already when the application
   deletes chunks through `/object/erase`; plain deletes are covered by the 7-day lifecycle).
 - Every restore tool replays it before reopening: the PBM restore runbook (drop databases of erased spaces,
   delete rows of erased users from `app_sys`), `s3vault rebuild`, follower restores.
 
 ### 2.5 Erasure of a space, end to end
 
-1. Core: space to `deleting`, export offered.
+1. Application: space to `deleting`, export offered.
 2. s3vault: freeze, `tenant-erase`, `POST /tenant/erase` (proof), outbox import, escrow copy confirmed.
-3. Core: drop the space database; delete its per-space backups (already unreadable: they live under the
+3. Application: drop the space database; delete its per-space backups (already unreadable: they live under the
    tenant's key); record the ledger entry for the space id.
 4. Within 2 days the shared PITR tier ages out; within 8 days B2 versions; within 30 days the last escrow
    copy of `K_t`. The verify step (runbook step 9) closes the record.
 
 ## 3. Open points
 
-- Journals per tenant and an epoch counter off the proxy (review H5) are not built.
+- Journals per tenant and an epoch counter off the proxy are not built.
 - Tenants and buckets are configuration (restart to add a bucket); dynamic tenants through an admin API
-  (review M1) come with the the application provisioner work.
-- Per-tenant quotas and cost attribution (review M2) are not built.
+  are not built.
+- Per-tenant quotas and cost attribution are not built.
