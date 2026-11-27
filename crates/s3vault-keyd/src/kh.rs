@@ -725,7 +725,7 @@ fn drill(args: &[String]) {
             backend: "file".into(),
             target: PubTarget::Master,
         };
-        fs::write(kd.dir.join(epoch_file_name(newest)), &bytes).unwrap_or_else(|e| die(e));
+        write_secret(&kd.dir.join(epoch_file_name(newest)), &bytes).unwrap_or_else(|e| die(e));
         ks.chain_from(&bytes);
         let id = ks.add_slot(&hp, "kh-drill", now_secs()).unwrap_or_else(|e| die(e));
         let nb = ks.seal().unwrap_or_else(|e| die(e));
