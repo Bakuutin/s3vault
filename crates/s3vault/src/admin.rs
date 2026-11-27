@@ -4,7 +4,8 @@
 //! else gets 401.
 //!
 //! ```text
-//! GET  /status
+//! GET  /status         includes `promote` (promote on read: queue depth, promoted, skipped_exists,
+//!                       skipped_tombstone, deferred, failed) and each bucket's fill budget
 //! GET  /fill
 //! POST /fill/start?bucket=B[&max_objects=N][&rate=BYTES_PER_SEC][&concurrency=N][&restart=1]
 //! POST /fill/stop?bucket=B
@@ -126,6 +127,7 @@ pub fn status_json(vault: &Vault, fills: &Fills) -> Value {
             "index_live": counts.map(|c| c.0),
             "index_tombstones": counts.map(|c| c.1),
             "index_live_bytes": counts.map(|c| c.2),
+            "fill_budget_bytes_per_sec": vault.fill_throttle(n).map(|t| t.rate()),
         }));
     }
     json!({
@@ -142,6 +144,7 @@ pub fn status_json(vault: &Vault, fills: &Fills) -> Value {
         "tenants": tenants_json(vault),
         "buckets": buckets,
         "fills": fills.statuses(vault),
+        "promote": vault.promoter.status(vault),
     })
 }
 

@@ -1,7 +1,8 @@
 //! The gateway logic, independent of the S3 wire layer: encrypt on write, decrypt on read, read-through
-//! from a fallback with write-back, tombstones, merged listings, copy and multipart staging.
+//! from a fallback with promotion to the store (`promote`), tombstones, merged listings, copy and multipart staging.
 
 use crate::config::{Config, META_BUCKET};
+use crate::promote::{PromoteJob, Promoter, Throttle};
 use crate::index::{FillRow, Index, LIVE, ObjRow, PartRow, TOMBSTONE, UploadRow};
 use crate::remote::{ByteStream, ListItem, Remote, RemoteError};
 use crate::spool::{Spool, SpoolWriter, spool_stream};
@@ -19,7 +20,7 @@ use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
@@ -233,12 +234,17 @@ pub enum FillOutcome {
     /// Already in the store of record.
     Present(ObjRow),
     Tombstoned,
-    /// Fetched from the fallback; `stored` tells whether the write-back succeeded.
-    Fetched {
-        spool: Spool,
-        info: ObjInfo,
-        stored: bool,
-    },
+    /// Fetched from the fallback and written to the store.
+    Fetched { info: ObjInfo },
+}
+
+/// What [`Vault::store_filled`] did.
+pub enum StoreFilled {
+    Stored,
+    /// A live row exists (a client write, the fill or another promotion): left alone.
+    Present,
+    /// The key is deleted: never written.
+    Tombstoned,
 }
 
 struct LiveGuard<'a>(&'a AtomicUsize);
@@ -268,6 +274,11 @@ pub struct Vault {
     pub staging_dir: PathBuf,
     pub started_ms: i64,
     pub last_unlock_error: RwLock<Option<String>>,
+    /// Promote on read (see `promote`).
+    pub promoter: Promoter,
+    /// Byte budget per bucket with a fallback, shared by its fill and its promotions.
+    throttles: HashMap<String, Arc<Throttle>>,
+    me: Weak<Vault>,
 }
 
 fn map_fallback(label: &str, e: RemoteError) -> VaultError {
@@ -329,7 +340,17 @@ impl Vault {
                 let _ = std::fs::remove_file(e.path());
             }
         }
-        Ok(Arc::new(Vault {
+        let throttles = buckets
+            .values()
+            .filter(|b| b.fallback.is_some())
+            .map(|b| {
+                (
+                    b.name.clone(),
+                    Arc::new(Throttle::new(cfg.fill.rate_bytes_per_sec)),
+                )
+            })
+            .collect();
+        Ok(Arc::new_cyclic(|me| Vault {
             cfg,
             buckets,
             stores,
@@ -342,7 +363,15 @@ impl Vault {
             staging_dir,
             started_ms: now_ms(),
             last_unlock_error: RwLock::new(None),
+            promoter: Promoter::default(),
+            throttles,
+            me: me.clone(),
         }))
+    }
+
+    /// The byte budget of a bucket with a fallback (fill and promotions).
+    pub fn fill_throttle(&self, bucket: &str) -> Option<Arc<Throttle>> {
+        self.throttles.get(bucket).cloned()
     }
 
     pub fn tenants_dir(&self) -> PathBuf {
@@ -710,33 +739,47 @@ impl Vault {
             Some(r) if r.state == TOMBSTONE => return Err(VaultError::NoSuchKey),
             Some(r) => r,
             None => {
-                if b.fallback.is_none() {
+                let Some(fb) = &b.fallback else {
                     return Err(VaultError::NoSuchKey);
+                };
+                // Read through: the whole object (also for a ranged read), verified, into a spool. The
+                // client is answered from it at once; the same spool is queued for promotion to the store,
+                // which happens in the background with the fill's rules (no fallback transfer twice).
+                let (spool, info) = {
+                    let _live = LiveGuard::new(&self.live_fetches);
+                    self.fetch_fallback(&u, fb, key).await?
+                };
+                let rng = check_range(range, info.size)?;
+                let spool = Arc::new(spool);
+                if self.cfg.fill.promote_on_read
+                    && let Some(me) = self.me.upgrade()
+                {
+                    self.promoter.enqueue(
+                        me,
+                        PromoteJob {
+                            bucket: b.name.clone(),
+                            key: key.to_string(),
+                            spool: spool.clone(),
+                            info: info.clone(),
+                        },
+                    );
                 }
-                match self.fill_one(&u, &t, &b, key, true).await? {
-                    FillOutcome::Present(r) => r,
-                    FillOutcome::Tombstoned => return Err(VaultError::NoSuchKey),
-                    FillOutcome::Fetched { spool, info, .. } => {
-                        let rng = check_range(range, info.size)?;
-                        let (s, e) = rng.unwrap_or((0, info.size));
-                        let body = if info.size == 0 {
-                            empty()
-                        } else {
-                            spool.range_stream(s, e)
-                        };
-                        // Keep the spool (and its temp file) alive until the body is consumed.
-                        let body: ByteStream =
-                            Box::pin(body.chain(futures::stream::once(async move {
-                                drop(spool);
-                                Ok(Bytes::new())
-                            })));
-                        return Ok(GetResult {
-                            info,
-                            range: rng,
-                            body,
-                        });
-                    }
-                }
+                let (s, e) = rng.unwrap_or((0, info.size));
+                let body = if info.size == 0 {
+                    empty()
+                } else {
+                    spool.range_stream(s, e)
+                };
+                // Keep the spool (and its temp file) alive until the body is consumed.
+                let body: ByteStream = Box::pin(body.chain(futures::stream::once(async move {
+                    drop(spool);
+                    Ok(Bytes::new())
+                })));
+                return Ok(GetResult {
+                    info,
+                    range: rng,
+                    body,
+                });
             }
         };
         self.read_stored(&t, &b, &row, range).await
@@ -807,14 +850,13 @@ impl Vault {
     }
 
     /// Fetch one key from the bucket's fallback and write it to the store of record (under the key lock,
-    /// create-only: an existing index row or tombstone always wins).
+    /// create-only: an existing index row or tombstone always wins). The background fill.
     pub async fn fill_one(
         &self,
         u: &Unlocked,
         t: &TenantRt,
         b: &BucketRt,
         key: &str,
-        live: bool,
     ) -> VResult<FillOutcome> {
         let fb = b.fallback.as_ref().ok_or(VaultError::NoSuchKey)?;
         let _g = self.lock_key(&b.name, key).await;
@@ -825,7 +867,20 @@ impl Vault {
                 FillOutcome::Present(r)
             });
         }
-        let _live = live.then(|| LiveGuard::new(&self.live_fetches));
+        let (spool, info) = self.fetch_fallback(u, fb, key).await?;
+        self.write_filled(t, b, key, &spool, &info).await?;
+        Ok(FillOutcome::Fetched { info })
+    }
+
+    /// Read a whole object from the fallback into a spool and check it: the size against the fallback's
+    /// answer, and the MD5 against a plain (non-multipart) ETag. Filled objects keep the fallback's ETag and
+    /// Last-Modified.
+    pub async fn fetch_fallback(
+        &self,
+        u: &Unlocked,
+        fb: &Remote,
+        key: &str,
+    ) -> VResult<(Spool, ObjInfo)> {
         let (meta, stream) = fb
             .get_stream(key, None)
             .await
@@ -856,36 +911,60 @@ impl Vault {
             meta: meta.meta.clone(),
             mtime_ms: meta.last_modified_ms.unwrap_or_else(now_ms),
         };
-        let res = self
-            .write_object(
-                t,
-                &b.store,
-                &b.name,
-                key,
-                spool.stream(),
-                &info,
-                spool.sha256_hex(),
-                next_generation(None),
-                false,
-                1,
-            )
-            .await;
-        match res {
-            Ok(_) => Ok(FillOutcome::Fetched {
-                spool,
-                info,
-                stored: true,
-            }),
-            Err(e) if live => {
-                warn!(bucket = %b.name, "write-back after read-through failed: {e}");
-                Ok(FillOutcome::Fetched {
-                    spool,
-                    info,
-                    stored: false,
-                })
-            }
-            Err(e) => Err(e),
+        Ok((spool, info))
+    }
+
+    /// Write a verified fallback object (from [`Self::fetch_fallback`]) to the store with the fill's rules:
+    /// under the key lock, create-only (a live row from a client write, the fill or another promotion
+    /// wins), never over a tombstone; encrypted like every write and recorded in the index (`origin` 1),
+    /// so the fill skips it. Promotions use this.
+    pub async fn store_filled(
+        &self,
+        t: &TenantRt,
+        b: &BucketRt,
+        key: &str,
+        spool: &Spool,
+        info: &ObjInfo,
+    ) -> VResult<StoreFilled> {
+        if spool.size != info.size {
+            return Err(VaultError::Internal(anyhow::anyhow!(
+                "promotion: spool holds {} bytes, expected {}",
+                spool.size,
+                info.size
+            )));
         }
+        let _g = self.lock_key(&b.name, key).await;
+        match t.index.get(&b.name, key)? {
+            Some(r) if r.state == TOMBSTONE => return Ok(StoreFilled::Tombstoned),
+            Some(_) => return Ok(StoreFilled::Present),
+            None => {}
+        }
+        self.write_filled(t, b, key, spool, info).await?;
+        Ok(StoreFilled::Stored)
+    }
+
+    /// The write of a filled object; the caller holds the key lock and checked that no row exists.
+    async fn write_filled(
+        &self,
+        t: &TenantRt,
+        b: &BucketRt,
+        key: &str,
+        spool: &Spool,
+        info: &ObjInfo,
+    ) -> VResult<ObjRow> {
+        self.write_object(
+            t,
+            &b.store,
+            &b.name,
+            key,
+            spool.stream(),
+            info,
+            spool.sha256_hex(),
+            next_generation(None),
+            false,
+            1,
+        )
+        .await
     }
 
     // ---------------------------------------------------------------- writes

@@ -215,6 +215,22 @@ pub struct FillCfg {
     /// never copies them and reconcile ignores them (neither counted against the cap nor removed).
     #[serde(default)]
     pub skip_prefixes: Vec<String>,
+    /// Promote on read: a GET served from the fallback (a miss in the store) also writes the whole object
+    /// to the store in the background, with the fill's rules (create-only under the per-key lock, never
+    /// over a tombstone, recorded in the index). The client is answered without waiting for the store.
+    /// Off: a miss is only read through, and the background fill copies it.
+    #[serde(default = "default_true")]
+    pub promote_on_read: bool,
+    /// Promotions waiting at most; a promotion that finds the queue full is dropped (`deferred`) and left
+    /// to the background fill.
+    #[serde(default = "default_promote_queue")]
+    pub promote_queue: usize,
+    /// Plaintext bytes the waiting promotions may hold (their spools) at most; beyond it, deferred.
+    #[serde(default = "default_promote_queue_bytes")]
+    pub promote_queue_bytes: u64,
+    /// Promotions written to the store in parallel at most.
+    #[serde(default = "default_promote_concurrency")]
+    pub promote_concurrency: usize,
 }
 
 impl FillCfg {
@@ -239,8 +255,25 @@ impl Default for FillCfg {
             yield_ms: default_fill_yield(),
             reconcile_max_fraction: default_reconcile_max_fraction(),
             skip_prefixes: Vec::new(),
+            promote_on_read: true,
+            promote_queue: default_promote_queue(),
+            promote_queue_bytes: default_promote_queue_bytes(),
+            promote_concurrency: default_promote_concurrency(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_promote_queue() -> usize {
+    1000
+}
+fn default_promote_queue_bytes() -> u64 {
+    256 << 20
+}
+fn default_promote_concurrency() -> usize {
+    2
 }
 
 fn default_fill_conc() -> usize {
@@ -347,6 +380,9 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.fill.reconcile_max_fraction) {
             bail!("fill.reconcile_max_fraction must be within 0..1");
+        }
+        if self.fill.promote_concurrency == 0 || self.fill.promote_concurrency > MAX_FILL_CONCURRENCY {
+            bail!("fill.promote_concurrency must be within 1..{MAX_FILL_CONCURRENCY}");
         }
         if self.fill.skip_prefixes.iter().any(|p| p.is_empty()) {
             bail!("fill.skip_prefixes must not contain an empty prefix (it would skip every key)");

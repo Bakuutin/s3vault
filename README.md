@@ -3,8 +3,8 @@
 `s3vault` is a small S3 server. Clients (applications, backup tools) talk plain S3 to it with their own
 access keys. It encrypts every object, **content and name**, before it leaves the host, and stores only
 ciphertext in a *store of record* (any S3: Backblaze B2, Garage, MinIO). For a migration it can read through
-from a *fallback* (an old plain store), serve the object and write it back encrypted, and copy everything in
-the background. The keyring lives in RAM only; it comes from `s3vault-keyd` on another host.
+from a *fallback* (an old plain store), serve the object and promote it to the store encrypted in the
+background (promote on read), and copy everything in the background. The keyring lives in RAM only; it comes from `s3vault-keyd` on another host.
 
 Threat model in short: the store of record (a cloud provider) is not trusted with content or names; the
 proxy host is trusted while running (its RAM holds the keys); the key service host is trusted to keep the
@@ -240,6 +240,41 @@ Guards (a reconcile against an empty or unreachable fallback would otherwise dro
 Cutover of a client: stop its writes to the fallback, reconcile, run a last fill pass with `restart=1`, then
 point the client at s3vault.
 
+### Promote on read
+
+A GET that misses the store and is served from the fallback also writes that object to the store, so the next
+read is served from the store (`[fill] promote_on_read = true`, the default):
+
+- The client does not wait for the store. The read fetches the **whole** object from the fallback into a spool
+  (RAM up to `server.memory_spool_max`, else an encrypted temp file), checks it (size, and MD5 against a plain
+  ETag), answers from it, and queues the same spool for promotion. A **ranged** GET also fetches the whole
+  object (as read-through always did), so the promotion needs no second transfer from the fallback.
+- The promotion follows the fill's rules: under the per-key lock, **create-only** (a key that has a row by then,
+  from a client write, the fill or another promotion, is left alone: `skipped_exists`), **never over a
+  tombstone** (`skipped_tombstone`), encrypted like every write, and recorded in the index (`origin` 1, the
+  fallback's ETag and Last-Modified), so the fill skips it.
+- Limits: at most `promote_queue` (default 1000) waiting promotions holding at most `promote_queue_bytes`
+  (default 256 MiB), `promote_concurrency` (default 2) writes in parallel. A promotion that finds the queue
+  full is dropped (`deferred`) and left to the background fill; a key already waiting is not queued twice
+  (`duplicate`). A failed write (`failed`) is also left to the fill.
+- Budget: promotions spend the bucket's fill byte budget (`rate` of the last `fill/start`, else
+  `fill.rate_bytes_per_sec`), **ahead of the fill**: while a promotion waits for budget the fill waits, so
+  promotions keep going when the fill is throttled hard, and the two together stay within the rate.
+- A delete or a client write that lands before the promotion wins (tombstone or row under the lock); a write
+  after it gets a higher generation, as always. The fallback down: 503 and nothing is queued.
+- `GET /status` -> `promote`: `queue_depth`, `queue_bytes`, `in_flight`, `enqueued`, `promoted`,
+  `promoted_bytes`, `skipped_exists`, `skipped_tombstone`, `deferred`, `duplicate`, `failed`, `last_error`;
+  each bucket shows `fill_budget_bytes_per_sec`.
+- `promote_on_read = false`: a miss is only read through; the fill copies it later.
+
+```toml
+[fill]
+promote_on_read = true        # default
+promote_queue = 1000          # waiting promotions (beyond: deferred to the fill)
+promote_queue_bytes = 268435456
+promote_concurrency = 2
+```
+
 ## Rotate
 
 - **Key-encryption key, format v2**: `docker compose run --rm admin rotate --dir /keys` moves to the next
@@ -446,6 +481,8 @@ above. A unit file change (`deploy/proxy/s3vault.service`) is installed separate
 
 - 503 everywhere: locked. `GET /status` -> `unlock_error`. Is keyd up on the key host (`docker logs s3vault-keyd`)?
   Is the proxy's address the one allowed?
+- `promote.failed` rising in `/status`: promotions cannot write to the store (`promote.last_error`, logged
+  `promotion failed`); reads are unaffected, the fill copies those keys later.
 - 503 for some keys: the fallback (or the store) is unreachable. Unfilled keys are never answered 404 while the
   fallback is down.
 - 500 `integrity check failed`: a stored object failed authentication (tampered, swapped, rolled back, or the

@@ -2,7 +2,7 @@
 //!
 //! Clients speak S3 to it with per-bucket access keys. It stores only ciphertext in the store of record
 //! (content and object names; see `s3vault_format::object`), reads through from an optional legacy store
-//! with write-back, keeps tombstones so a fallback never resurrects a delete, and holds its keyring only in
+//! and promotes what it read to the store in the background, keeps tombstones so a fallback never resurrects a delete, and holds its keyring only in
 //! RAM (fetched from `s3vault-keyd`). The sqlite index is a cache: the store plus the keyring rebuild it.
 
 pub mod admin;
@@ -11,6 +11,7 @@ pub mod config;
 pub mod erasure;
 pub mod index;
 pub mod migrate;
+pub mod promote;
 pub mod remote;
 pub mod s3;
 pub mod server;

@@ -171,37 +171,6 @@ pub struct Fills {
     map: Mutex<HashMap<String, Arc<FillHandle>>>,
 }
 
-struct RateLimiter {
-    rate: f64,
-    state: tokio::sync::Mutex<(f64, Instant)>,
-}
-
-impl RateLimiter {
-    fn new(rate: u64) -> Self {
-        RateLimiter {
-            rate: rate.max(1) as f64,
-            state: tokio::sync::Mutex::new((rate as f64, Instant::now())),
-        }
-    }
-    async fn acquire(&self, n: u64) {
-        loop {
-            let wait = {
-                let mut st = self.state.lock().await;
-                let now = Instant::now();
-                st.0 = (st.0 + now.duration_since(st.1).as_secs_f64() * self.rate).min(self.rate);
-                st.1 = now;
-                let need = (n as f64).min(self.rate);
-                if st.0 >= need {
-                    st.0 -= n as f64;
-                    return;
-                }
-                (need - st.0) / self.rate
-            };
-            tokio::time::sleep(Duration::from_secs_f64(wait.max(0.01))).await;
-        }
-    }
-}
-
 impl Fills {
     pub fn statuses(&self, vault: &Vault) -> Vec<FillStatus> {
         let map = self.map.lock().unwrap();
@@ -326,7 +295,11 @@ async fn run_fill(
     let u = vault.unlocked()?;
     let (b, t) = vault.tenant_of(&u, bucket)?;
     let fb = b.fallback.clone().context("no fallback")?;
-    let limiter = RateLimiter::new(rate);
+    // The bucket's budget, shared with promotions (which go first); this session sets its rate.
+    let limiter = vault
+        .fill_throttle(bucket)
+        .context("bucket has no fill budget")?;
+    limiter.set_rate(rate);
     let mut row = t.index.fill_get(bucket)?;
     let mut session: u64 = 0;
     info!(bucket, cursor = %row.cursor, ?max_objects, rate, concurrency, "fill started");
@@ -377,7 +350,7 @@ async fn run_fill(
                 let t = t.clone();
                 let b = b.clone();
                 let h = h.clone();
-                let limiter = &limiter;
+                let limiter = limiter.clone();
                 async move {
                     let mut paused = false;
                     while vault.live_fetches.load(Ordering::SeqCst) > 0
@@ -404,8 +377,8 @@ async fn run_fill(
                         }
                     }
                     limiter.acquire(it.size).await;
-                    let r = match vault.fill_one(&u, &t, &b, &it.key, false).await {
-                        Ok(FillOutcome::Fetched { info, .. }) => ItemResult::Copied(info.size),
+                    let r = match vault.fill_one(&u, &t, &b, &it.key).await {
+                        Ok(FillOutcome::Fetched { info }) => ItemResult::Copied(info.size),
                         Ok(_) | Err(VaultError::NoSuchKey) => ItemResult::Skipped,
                         Err(e) => ItemResult::Failed(it.key, e.to_string()),
                     };

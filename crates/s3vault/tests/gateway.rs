@@ -206,6 +206,11 @@ async fn wait_unlocked(r: &s3vault::Running) {
 }
 
 async fn setup() -> Env {
+    setup_with("").await
+}
+
+/// `extra` is appended to the config (it lands in the trailing `[fill]` table).
+async fn setup_with(extra: &str) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     let store = start_fs_s3(&dir.join("store"), None).await;
@@ -227,7 +232,8 @@ async fn setup() -> Env {
         keyring_path.display(),
         d = dir.display()
     );
-    let cfg: Config = toml::from_str(&config_text(&dir, store.addr, fallback.addr, &keys)).unwrap();
+    let text = config_text(&dir, store.addr, fallback.addr, &keys) + extra;
+    let cfg: Config = toml::from_str(&text).unwrap();
     cfg.validate().unwrap();
     client(&format!("http://{}", store.addr), AK, SK)
         .create_bucket()
@@ -845,6 +851,7 @@ async fn read_through_write_back_tombstones_and_503() {
         .await
         .unwrap();
     assert_eq!(r, &old[70000..=80000]);
+    wait_promotions(env.vault()).await;
     let row = idx.get("data", "rec/a.opus").unwrap().unwrap();
     assert_eq!(
         (row.state, row.origin, row.size),
@@ -1261,6 +1268,7 @@ async fn reconcile_and_fill_skip_temporary_prefixes() {
     for k in &temp {
         get_all(&env.rw, "data", k, None).await.unwrap();
     }
+    wait_promotions(env.vault()).await;
     let idx = tidx(env.vault(), "data");
     assert_eq!(idx.get("data", &temp[0]).unwrap().unwrap().origin, 1);
     admin_post(&env, "/fill/start?bucket=data").await;
@@ -1396,6 +1404,17 @@ async fn admin_status_code(env: &Env, path: &str, token: Option<&str>) -> u16 {
         r = r.bearer_auth(t);
     }
     r.send().await.unwrap().status().as_u16()
+}
+
+/// Wait until no promotion (promote on read) is queued or in flight.
+async fn wait_promotions(v: &s3vault::vault::Vault) {
+    for _ in 0..400 {
+        if v.promoter.idle() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("promotions did not finish");
 }
 
 async fn wait_fill_idle(env: &Env) {
@@ -1587,5 +1606,220 @@ async fn rotation_escrow_gate_in_proxy() {
     assert_eq!(v2.unlocked().unwrap().master.fingerprint(), fp);
     assert_eq!(put(v2.clone(), "gen2").await, 2);
     assert_eq!(s3vault::background::read_all(&v2, "plain", "gen1").await.unwrap(), b"x");
+    env.running.unwrap().shutdown().await;
+}
+
+// ------------------------------------------------------------------ promote on read
+
+async fn legacy_put(env: &Env, key: &str, body: Vec<u8>) {
+    env.legacy
+        .put_object()
+        .bucket("legacy")
+        .key(key)
+        .body(ByteStream::from(body))
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn legacy_delete(env: &Env, key: &str) {
+    env.legacy
+        .delete_object()
+        .bucket("legacy")
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+}
+
+fn promote_status(env: &Env) -> s3vault::promote::PromoteStatus {
+    env.vault().promoter.status(env.vault())
+}
+
+/// Hold promotions back: the bucket's budget goes `secs` seconds into debt at `rate`.
+async fn throttle_debt(env: &Env, rate: u64, secs: f64) {
+    let th = env.vault().fill_throttle("data").unwrap();
+    th.set_rate(rate);
+    th.acquire(rate + (rate as f64 * secs) as u64).await;
+}
+
+async fn wait_for(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A miss is served from the fallback and promoted in the background; the next read comes from the store
+/// (the fallback no longer has the object); a ranged read promotes the whole object; `/status` counts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_on_read_whole_and_ranged() {
+    let env = setup().await;
+    let a = data(150_000, 3);
+    let b = data(200_000, 4);
+    legacy_put(&env, "p/a", a.clone()).await;
+    legacy_put(&env, "p/b", b.clone()).await;
+    let idx = tidx(env.vault(), "data");
+    assert_eq!(get_all(&env.rw, "data", "p/a", None).await.unwrap(), a);
+    let r = get_all(&env.rw, "data", "p/b", Some("bytes=1000-1999")).await.unwrap();
+    assert_eq!(r, &b[1000..2000]);
+    wait_promotions(env.vault()).await;
+    let ra = idx.get("data", "p/a").unwrap().unwrap();
+    let rb = idx.get("data", "p/b").unwrap().unwrap();
+    assert_eq!((ra.state, ra.origin, ra.size), (LIVE, 1, a.len() as u64));
+    assert_eq!((rb.state, rb.origin, rb.size), (LIVE, 1, b.len() as u64), "ranged read promoted the whole object");
+    use sha2::Digest;
+    assert_eq!(rb.sha256, hex::encode(sha2::Sha256::digest(&b)));
+    // Gone from the fallback: the second reads can only come from the store.
+    legacy_delete(&env, "p/a").await;
+    legacy_delete(&env, "p/b").await;
+    assert_eq!(get_all(&env.rw, "data", "p/a", None).await.unwrap(), a);
+    assert_eq!(get_all(&env.rw, "data", "p/b", None).await.unwrap(), b);
+    assert_eq!(
+        get_all(&env.rw, "data", "p/b", Some("bytes=150000-150099")).await.unwrap(),
+        &b[150_000..150_100]
+    );
+    let st = admin_get(&env, "/status").await;
+    let p = &st["promote"];
+    assert_eq!(p["enabled"], true);
+    assert_eq!((p["promoted"].as_u64(), p["promoted_bytes"].as_u64()), (Some(2), Some(350_000)), "{p}");
+    assert_eq!((p["failed"].as_u64(), p["deferred"].as_u64(), p["queue_depth"].as_u64()), (Some(0), Some(0), Some(0)));
+    // The fill skips promoted keys.
+    legacy_put(&env, "p/c", data(10, 1)).await;
+    admin_post(&env, "/fill/start?bucket=data").await;
+    wait_fill_idle(&env).await;
+    let f = admin_get(&env, "/fill").await;
+    assert_eq!(f[0]["total"]["copied"].as_u64(), Some(1), "{f}");
+    env.running.unwrap().shutdown().await;
+}
+
+/// A delete before the promotion runs: never promoted. A live write racing the promotion: the live write
+/// wins. The fallback down: 503 and nothing queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_on_read_races_and_outage() {
+    let env = setup().await;
+    let idx = tidx(env.vault(), "data");
+    legacy_put(&env, "r/del", data(3000, 1)).await;
+    legacy_put(&env, "r/put", data(3000, 2)).await;
+    legacy_put(&env, "r/down", data(3000, 3)).await;
+    // About 1.5 s of debt: both promotions wait at the budget.
+    throttle_debt(&env, 10_000, 1.5).await;
+    get_all(&env.rw, "data", "r/del", None).await.unwrap();
+    get_all(&env.rw, "data", "r/put", None).await.unwrap();
+    wait_for("both promotions in flight", || promote_status(&env).in_flight == 2).await;
+    env.rw.delete_object().bucket("data").key("r/del").send().await.unwrap();
+    env.rw
+        .put_object()
+        .bucket("data")
+        .key("r/put")
+        .body(ByteStream::from_static(b"live write"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!env.vault().promoter.idle(), "the promotions were still waiting");
+    wait_promotions(env.vault()).await;
+    let st = promote_status(&env);
+    assert_eq!((st.promoted, st.skipped_tombstone, st.skipped_exists, st.failed), (0, 1, 1, 0), "{st:?}");
+    assert_eq!(idx.get("data", "r/del").unwrap().unwrap().state, TOMBSTONE);
+    assert_eq!(
+        http_status(&env.rw.get_object().bucket("data").key("r/del").send().await.unwrap_err()),
+        404
+    );
+    let rp = idx.get("data", "r/put").unwrap().unwrap();
+    assert_eq!((rp.origin, rp.size), (0, 10));
+    assert_eq!(get_all(&env.rw, "data", "r/put", None).await.unwrap(), b"live write");
+    // The fallback down: a miss is 503, nothing is queued or written.
+    env.vault().fill_throttle("data").unwrap().set_rate(100_000_000);
+    env.fallback.kill();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        http_status(&env.rw.get_object().bucket("data").key("r/down").send().await.unwrap_err()),
+        503
+    );
+    let st2 = promote_status(&env);
+    assert_eq!(st2.enqueued, st.enqueued);
+    assert!(env.vault().promoter.idle());
+    assert!(idx.get("data", "r/down").unwrap().is_none());
+    env.running.unwrap().shutdown().await;
+}
+
+/// A full queue defers the promotion (counted); the background fill copies the key later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_on_read_full_queue_defers_to_fill() {
+    let env = setup_with("promote_queue = 1\npromote_concurrency = 1\n").await;
+    let idx = tidx(env.vault(), "data");
+    for k in ["q/1", "q/2", "q/3"] {
+        legacy_put(&env, k, data(2000, k.len() as u8)).await;
+    }
+    throttle_debt(&env, 10_000, 1.0).await;
+    get_all(&env.rw, "data", "q/1", None).await.unwrap();
+    wait_for("q/1 in flight", || promote_status(&env).in_flight == 1).await;
+    get_all(&env.rw, "data", "q/2", None).await.unwrap(); // waits in the queue
+    assert_eq!(get_all(&env.rw, "data", "q/3", None).await.unwrap(), data(2000, 3), "still served");
+    let st = promote_status(&env);
+    assert_eq!((st.queue_depth, st.in_flight, st.deferred, st.enqueued), (1, 1, 1, 2), "{st:?}");
+    assert_eq!(admin_get(&env, "/status").await["promote"]["deferred"], 1);
+    // A second read of a waiting key is not queued twice.
+    get_all(&env.rw, "data", "q/2", None).await.unwrap();
+    assert_eq!(promote_status(&env).duplicate, 1);
+    wait_promotions(env.vault()).await;
+    assert_eq!(promote_status(&env).promoted, 2);
+    assert!(idx.get("data", "q/3").unwrap().is_none(), "deferred: not promoted");
+    admin_post(&env, "/fill/start?bucket=data&rate=100000000").await;
+    wait_fill_idle(&env).await;
+    let f = admin_get(&env, "/fill").await;
+    assert_eq!((f[0]["session_copied"].as_u64(), f[0]["session_skipped"].as_u64()), (Some(1), Some(2)), "{f}");
+    assert_eq!(idx.get("data", "q/3").unwrap().unwrap().origin, 1);
+    env.running.unwrap().shutdown().await;
+}
+
+/// Promotions spend the fill's byte budget, ahead of a running fill: from an empty budget at 20 kB/s three
+/// 10 kB promotions take about 1.5 s (not instant) and finish while the throttled fill is early in its pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_on_read_respects_the_fill_budget_with_priority() {
+    let env = setup_with("promote_concurrency = 1\n").await;
+    for i in 0..10 {
+        legacy_put(&env, &format!("a/{i:02}"), data(10_000, i)).await;
+    }
+    for i in 0..3 {
+        legacy_put(&env, &format!("z/{i}"), data(10_000, 50 + i)).await;
+    }
+    let r = admin_post(&env, "/fill/start?bucket=data&rate=20000&concurrency=1").await;
+    assert_eq!(r["started"], "data");
+    wait_for("budget set", || env.vault().fill_throttle("data").unwrap().rate() == 20_000).await;
+    // Start from an empty budget (it holds up to one second's worth).
+    env.vault().fill_throttle("data").unwrap().acquire(20_000).await;
+    let t0 = std::time::Instant::now();
+    for i in 0..3 {
+        get_all(&env.rw, "data", &format!("z/{i}"), None).await.unwrap();
+    }
+    wait_promotions(env.vault()).await;
+    let took = t0.elapsed();
+    assert_eq!(promote_status(&env).promoted, 3);
+    assert!(took >= Duration::from_millis(1_300), "budget respected: {took:?}");
+    assert!(took < Duration::from_millis(4_000), "{took:?}");
+    let f = admin_get(&env, "/fill").await;
+    assert_eq!(f[0]["running"], true, "{f}");
+    assert!(f[0]["session_copied"].as_u64().unwrap() <= 4, "the fill yielded: {f}");
+    let st = admin_get(&env, "/status").await;
+    assert_eq!(st["buckets"][0]["fill_budget_bytes_per_sec"], 20_000, "{st}");
+    admin_post(&env, "/fill/stop?bucket=data").await;
+    wait_fill_idle(&env).await;
+    env.running.unwrap().shutdown().await;
+}
+
+/// `promote_on_read = false`: a miss is only read through (the fill copies it later).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_on_read_off() {
+    let env = setup_with("promote_on_read = false\n").await;
+    legacy_put(&env, "o/1", data(5000, 1)).await;
+    assert_eq!(get_all(&env.rw, "data", "o/1", None).await.unwrap(), data(5000, 1));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(tidx(env.vault(), "data").get("data", "o/1").unwrap().is_none());
+    let st = promote_status(&env);
+    assert_eq!((st.enabled, st.enqueued), (false, 0));
     env.running.unwrap().shutdown().await;
 }
