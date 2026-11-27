@@ -211,6 +211,17 @@ pub struct FillCfg {
     /// Reconcile refuses to remove more than this fraction of the checked filled rows unless forced.
     #[serde(default = "default_reconcile_max_fraction")]
     pub reconcile_max_fraction: f64,
+    /// Key prefixes of temporary objects (for the application: `.sessions/`, `.staging/`). The fill
+    /// never copies them and reconcile ignores them (neither counted against the cap nor removed).
+    #[serde(default)]
+    pub skip_prefixes: Vec<String>,
+}
+
+impl FillCfg {
+    /// True when `key` lies under one of `skip_prefixes`.
+    pub fn is_skipped(&self, key: &str) -> bool {
+        self.skip_prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    }
 }
 
 /// Upper bound for the fill concurrency an admin call may ask for.
@@ -227,6 +238,7 @@ impl Default for FillCfg {
             rate_bytes_per_sec: default_fill_rate(),
             yield_ms: default_fill_yield(),
             reconcile_max_fraction: default_reconcile_max_fraction(),
+            skip_prefixes: Vec::new(),
         }
     }
 }
@@ -335,6 +347,9 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.fill.reconcile_max_fraction) {
             bail!("fill.reconcile_max_fraction must be within 0..1");
+        }
+        if self.fill.skip_prefixes.iter().any(|p| p.is_empty()) {
+            bail!("fill.skip_prefixes must not contain an empty prefix (it would skip every key)");
         }
         match self.keys.source {
             KeySource::Keyd => {

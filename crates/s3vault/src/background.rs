@@ -152,6 +152,8 @@ pub struct FillStatus {
     pub session_copied: u64,
     pub session_bytes: u64,
     pub session_skipped: u64,
+    /// Keys under `fill.skip_prefixes` passed over this session (temporary objects, never copied).
+    pub session_skipped_temp: u64,
     pub session_errors: u64,
     pub live_pauses: u64,
     pub last_error: Option<String>,
@@ -365,6 +367,9 @@ async fn run_fill(
             }
         }
         let last_key = items.last().map(|i| i.key.clone());
+        let before = items.len();
+        items.retain(|i| !vault.cfg.fill.is_skipped(&i.key));
+        h.status.lock().unwrap().session_skipped_temp += (before - items.len()) as u64;
         let results: Vec<ItemResult> = futures::stream::iter(items.into_iter())
             .map(|it| {
                 let vault = vault.clone();
@@ -575,6 +580,8 @@ pub async fn verify(
 #[derive(Debug, Default, Serialize)]
 pub struct ReconcileReport {
     pub checked: u64,
+    /// Filled rows under `fill.skip_prefixes` (temporary objects): ignored, neither checked nor removed.
+    pub skipped_temp: u64,
     pub gone_in_fallback: u64,
     pub changed_in_fallback: u64,
     /// Rows found stale (gone or changed). A real run must be called with `expect` equal to this.
@@ -646,6 +653,10 @@ pub async fn reconcile(
             .into_iter()
             .filter(|r| r.origin == 1 && r.state == LIVE)
         {
+            if vault.cfg.fill.is_skipped(&r.key) {
+                rep.skipped_temp += 1;
+                continue;
+            }
             rep.checked += 1;
             let mut pages = 0;
             let listed: Option<String> = loop {
@@ -743,7 +754,7 @@ pub async fn reconcile(
         }
     }
     rep.elapsed_ms = t0.elapsed().as_millis() as u64;
-    info!(bucket, checked = rep.checked, stale = rep.stale, removed = rep.removed, dry_run = rep.dry_run, "reconcile done");
+    info!(bucket, checked = rep.checked, skipped_temp = rep.skipped_temp, stale = rep.stale, removed = rep.removed, dry_run = rep.dry_run, "reconcile done");
     Ok(rep)
 }
 

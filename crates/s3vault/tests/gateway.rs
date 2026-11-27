@@ -160,6 +160,7 @@ read_buckets = ["data"]
 concurrency = 2
 rate_bytes_per_sec = 100000000
 yield_ms = 20
+skip_prefixes = [".sessions/", ".staging/"]
 "#,
         data = dir.join("data").display(),
         dir = dir.display(),
@@ -1232,6 +1233,63 @@ async fn background_fill_and_verify() {
     assert_eq!(again["removed"], 0);
     let status = admin_get(&env, "/status").await;
     assert_eq!(status["locked"], false);
+    env.running.unwrap().shutdown().await;
+}
+
+/// Temporary prefixes (`fill.skip_prefixes`): the fill never copies them, reconcile ignores them (the ST1-b case:
+/// 13 leftover `.sessions/` objects among real chunks must not trip the 1% cap), real mismatches above
+/// the cap still stop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_and_fill_skip_temporary_prefixes() {
+    let env = setup().await;
+    let put = |k: String, body: Vec<u8>| {
+        let c = env.legacy.clone();
+        async move {
+            c.put_object().bucket("legacy").key(k).body(ByteStream::from(body)).send().await.unwrap();
+        }
+    };
+    for i in 0..100 {
+        put(format!("audio/a/{i:06}.opus"), data(200 + i, i as u8)).await;
+    }
+    let mut temp: Vec<String> = (0..13).map(|i| format!(".sessions/up{i:02}")).collect();
+    temp.push(".staging/up00".into());
+    for k in &temp {
+        put(k.clone(), data(50, 1)).await;
+    }
+    put(".sessions/never-read".into(), data(50, 2)).await;
+    // The temp objects were filled before the skip existed: a read-through creates the same filled rows.
+    for k in &temp {
+        get_all(&env.rw, "data", k, None).await.unwrap();
+    }
+    let idx = tidx(env.vault(), "data");
+    assert_eq!(idx.get("data", &temp[0]).unwrap().unwrap().origin, 1);
+    admin_post(&env, "/fill/start?bucket=data").await;
+    wait_fill_idle(&env).await;
+    let st = admin_get(&env, "/fill").await;
+    assert_eq!(st[0]["total"]["finished"], true);
+    assert_eq!(st[0]["total"]["copied"].as_u64().unwrap(), 100, "{st}");
+    assert_eq!(st[0]["session_skipped_temp"].as_u64().unwrap(), 15, "{st}");
+    assert!(idx.get("data", ".sessions/never-read").unwrap().is_none(), "temp object not copied");
+    // The core's sweep removed the sessions on the old store: 14 stale temp rows, 0 stale real rows.
+    for k in &temp {
+        env.legacy.delete_object().bucket("legacy").key(k).send().await.unwrap();
+    }
+    let dry = admin_post(&env, "/reconcile?bucket=data&dry_run=1").await;
+    assert_eq!((dry["checked"].as_u64(), dry["skipped_temp"].as_u64(), dry["stale"].as_u64()),
+        (Some(100), Some(14), Some(0)), "{dry}");
+    let rec = admin_post(&env, "/reconcile?bucket=data&expect=0").await;
+    assert_eq!(rec["removed"], 0, "passes without force: {rec}");
+    assert!(idx.get("data", &temp[0]).unwrap().is_some(), "temp rows ignored, not removed");
+    // Real mismatches above 1% still stop it.
+    for i in [3, 7] {
+        env.legacy.delete_object().bucket("legacy").key(format!("audio/a/{i:06}.opus")).send().await.unwrap();
+    }
+    let dry = admin_post(&env, "/reconcile?bucket=data&dry_run=1").await;
+    assert_eq!((dry["stale"].as_u64(), dry["skipped_temp"].as_u64()), (Some(2), Some(14)), "{dry}");
+    let capped = admin_post(&env, "/reconcile?bucket=data&expect=2").await;
+    assert!(capped["error"].as_str().unwrap().contains("cap"), "{capped}");
+    let rec = admin_post(&env, "/reconcile?bucket=data&expect=2&force=1").await;
+    assert_eq!(rec["removed"], 2);
     env.running.unwrap().shutdown().await;
 }
 

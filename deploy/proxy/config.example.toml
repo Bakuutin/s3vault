@@ -68,3 +68,4 @@ concurrency = 4
 rate_bytes_per_sec = 1000000         # default fill budget; live read-through misses are not limited
 yield_ms = 250
 reconcile_max_fraction = 0.01        # reconcile refuses to drop more than 1% of filled rows without force=1
+# skip_prefixes = [".sessions/", ".staging/"]   # temporary objects: never filled, ignored by reconcile

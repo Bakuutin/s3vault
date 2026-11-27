@@ -232,7 +232,10 @@ Guards (a reconcile against an empty or unreachable fallback would otherwise dro
 - a key counts as deleted only when a direct HEAD answers 404; any other error aborts the run;
 - a real run needs `expect` equal to the dry run's `stale` (so a dry run always comes first), and is refused
   when it would remove more than `fill.reconcile_max_fraction` (default 0.01) of the checked filled rows,
-  unless `force=1` is added after checking the fallback.
+  unless `force=1` is added after checking the fallback;
+- keys under `fill.skip_prefixes` (temporary objects, for the application `.sessions/` and `.staging/`)
+  are ignored: not checked, not counted against the cap, not removed (reported as `skipped_temp`). The fill
+  never copies them either (`session_skipped_temp` in `/fill`).
 
 Cutover of a client: stop its writes to the fallback, reconcile, run a last fill pass with `restart=1`, then
 point the client at s3vault.
