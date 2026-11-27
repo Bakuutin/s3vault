@@ -11,7 +11,8 @@
 //! s3vault-keyd init --dir DIR                 create a v2 master keyring and the psk (refuses to overwrite)
 //! s3vault-keyd upgrade-v2 --dir DIR           v1 keyring -> v2 master with a new random root; the v1 keys
 //!                                             are kept as legacy keys (migration, rollback); keyring.v1.<t> backup
-//! s3vault-keyd serve --dir DIR --listen ADDR --allow IP[,IP...]
+//! s3vault-keyd serve --dir DIR --listen ADDR --allow IP[,IP...] [--source files|keystore --slot DESC]
+//!                                             keystore: open the newest epoch per request with the host slot
 //! s3vault-keyd rotate --dir DIR               v2: next KEK generation (deterministic, no new escrow)
 //!                                             v1: add a key as pending (used only after escrow-confirm)
 //! s3vault-keyd escrow-export --dir DIR        write the master keyring to stdout (refuses a terminal)
@@ -29,8 +30,13 @@
 //! s3vault-keyd escrow-prune --dir DIR [--max-age-days 30]   delete escrow copies older than the limit
 //! s3vault-keyd ledger-import --dir DIR < OUTBOX   import a proxy's outbox (object erasures, proofs)
 //! s3vault-keyd ledger-show --dir DIR          verify and print the ledger (no secrets)
-//! s3vault-keyd fetch --addr ADDR --psk FILE   test client: fetch and print the fingerprint only
+//! s3vault-keyd fetch --addr ADDR --psk FILE [--detail]   test client: fingerprints only (--detail: bundle
+//!                                             sha256 and each tenant's id, status and K_t fingerprint)
 //! ```
+//!
+//! Key hierarchy (keystore, slots, drills): see `kh.rs`.
+
+mod kh;
 
 use s3vault_format::keyproto;
 use s3vault_format::keyring::Keyring;
@@ -503,25 +509,62 @@ fn main() {
             s.set_read_timeout(Some(Duration::from_secs(10))).ok();
             match keyproto::client_fetch_with(&mut s, &psk, keyproto::MAGIC2) {
                 Ok(text) => {
-                    let b = Bundle::parse(std::str::from_utf8(&text).unwrap_or(""))
-                        .unwrap_or_else(|e| die(e));
+                    let t = std::str::from_utf8(&text).unwrap_or("");
+                    let b = Bundle::parse(t).unwrap_or_else(|e| die(e));
                     println!(
                         "ok: master {} tenants {} ledger {}",
                         b.master.fingerprint(),
                         b.tenants.tenants.len(),
                         b.ledger.entries.len()
                     );
+                    if args.iter().any(|a| a == "--detail") {
+                        let base = s3vault_format::keystore::Baseline::from_bundle(t).unwrap_or_else(|e| die(e));
+                        println!("bundle_sha256 {} root_escrow_digest {} ledger_head {}", base.bundle_sha256, base.root_escrow_digest, base.ledger_head);
+                        for (n, (id, st, fp)) in &base.tenants {
+                            println!("tenant {n} {id} {st} k_t_fp {fp}");
+                        }
+                    }
                 }
                 Err(e) => die(format!("fetch failed: {e}")),
             }
         }
         "serve" => serve(&args),
-        _ => usage(),
+        other => {
+            if !kh::run(other, &args) {
+                usage()
+            }
+        }
     }
 }
 
 /// The payload for a protocol version: v1 gets the (legacy) v1 keyring, v2 the bundle.
-fn payload(dir: &Path, version: u8) -> Result<(Zeroizing<Vec<u8>>, String), String> {
+#[derive(Clone)]
+enum Source {
+    Files,
+    /// The newest keystore epoch, opened per request with the host slot (nothing cached, review R8).
+    Keystore(String),
+}
+
+fn payload(dir: &Path, version: u8, source: &Source) -> Result<(Zeroizing<Vec<u8>>, String), String> {
+    if let Source::Keystore(slot) = source {
+        let (n, bytes) = s3vault_format::keystore::KeystoreDir::new(dir.join("keystore"))
+            .read_newest()
+            .map_err(|e| e.to_string())?;
+        let secret = s3vault_format::slots::open_descriptor(slot).map_err(|e| e.to_string())?;
+        let ks = s3vault_format::keystore::Keystore::open(&bytes, secret.as_ref())
+            .map_err(|e| format!("keystore epoch {n}: {e}"))?;
+        let m = ks.master().map_err(|e| e.to_string())?;
+        if version == 1 {
+            let t = m.legacy_text().ok_or("no legacy keys for a v1 client")?;
+            let fp = m.legacy.as_ref().map(|l| l.fingerprint()).unwrap_or_default();
+            return Ok((Zeroizing::new(t.as_bytes().to_vec()), format!("legacy v1 keyring {fp} (keystore epoch {n})")));
+        }
+        let text = ks.bundle_text().map_err(|e| e.to_string())?;
+        return Ok((
+            Zeroizing::new(text.as_bytes().to_vec()),
+            format!("bundle {} ({} tenants) from keystore epoch {n}", m.fingerprint(), ks.tenants.tenants.len()),
+        ));
+    }
     match (read_master(dir)?, version) {
         (Master::V1(kr), 1) => Ok((
             Zeroizing::new(kr.to_text().as_bytes().to_vec()),
@@ -556,19 +599,35 @@ fn serve(args: &[String]) {
         .split(',')
         .map(|s| s.trim().parse().unwrap_or_else(|_| usage()))
         .collect();
-    // Validate the files once at start; they are re-read per request.
-    match read_master(&dir).unwrap_or_else(|e| {
-        log(&e);
-        std::process::exit(1)
-    }) {
-        Master::V1(k) => log(&format!("v1 keyring {} kids {:?}", k.fingerprint(), k.kids())),
-        Master::V2(m) => log(&format!(
-            "master v2 {} escrowed {}; tenants {}; ledger {}",
-            m.fingerprint(),
-            m.is_escrowed(),
-            read_tenants(&dir).map(|t| t.tenants.len()).unwrap_or(0),
-            read_ledger(&dir).map(|l| l.entries.len()).unwrap_or(0)
-        )),
+    let source = match arg(args, "--source").as_deref() {
+        None | Some("files") => Source::Files,
+        Some("keystore") => Source::Keystore(need(args, "--slot")),
+        Some(_) => usage(),
+    };
+    if let Source::Keystore(slot) = &source {
+        // validate once at start (the newest epoch opens with the host slot); re-read per request
+        match payload(&dir, 2, &source) {
+            Ok((_, what)) => log(&format!("source keystore (slot {}): {what}", slot.split(':').next().unwrap_or(""))),
+            Err(e) => {
+                log(&format!("keystore: {e}"));
+                std::process::exit(1)
+            }
+        }
+    } else {
+        // Validate the files once at start; they are re-read per request.
+        match read_master(&dir).unwrap_or_else(|e| {
+            log(&e);
+            std::process::exit(1)
+        }) {
+            Master::V1(k) => log(&format!("v1 keyring {} kids {:?}", k.fingerprint(), k.kids())),
+            Master::V2(m) => log(&format!(
+                "master v2 {} escrowed {}; tenants {}; ledger {}",
+                m.fingerprint(),
+                m.is_escrowed(),
+                read_tenants(&dir).map(|t| t.tenants.len()).unwrap_or(0),
+                read_ledger(&dir).map(|l| l.entries.len()).unwrap_or(0)
+            )),
+        }
     }
     read_psk(&dir.join("psk")).unwrap_or_else(|e| {
         log(&e);
@@ -602,6 +661,7 @@ fn serve(args: &[String]) {
         active.fetch_add(1, Ordering::SeqCst);
         let dir = dir.clone();
         let active = active.clone();
+        let source = source.clone();
         std::thread::spawn(move || {
             let mut stream = stream;
             stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -610,7 +670,7 @@ fn serve(args: &[String]) {
             let result = (|| -> Result<u8, String> {
                 let psk = read_psk(&dir.join("psk"))?;
                 keyproto::server_serve_versioned(&mut stream, &psk, |v| {
-                    let (p, w) = payload(&dir, v)?;
+                    let (p, w) = payload(&dir, v, &source)?;
                     what = w;
                     Ok(p)
                 })

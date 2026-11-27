@@ -10,3 +10,7 @@ s3vault-format.workspace = true
 zeroize.workspace = true
 libc = "0.2"
 serde_json.workspace = true
+hex.workspace = true
+
+[features]
+fault-injection = ["s3vault-format/fault-injection"]

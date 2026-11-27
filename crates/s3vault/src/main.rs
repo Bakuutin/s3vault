@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! s3vault serve   --config FILE
-//! s3vault check   --config FILE            validate the config and fetch the keys (prints fingerprints only)
+//! s3vault check   --config FILE            validate the config and fetch the keys (prints fingerprints only:
+//!                                          master, each tenant's K_t, the bundle SHA-256)
 //! s3vault rebuild --config FILE --out NEW_DATA_DIR [--tenant NAME] [--snapshot] [--concurrency N]
 //!                 [--no-replay] [--keyring-file F --tenants-file F --ledger-file F]
 //!                 rebuild the index partitions from the store (and the tenant snapshots); replays the
@@ -95,10 +96,14 @@ fn main() -> Result<()> {
                 b.master.escrow_places(),
                 b.master.legacy.as_ref().map(|l| l.fingerprint()).unwrap_or_else(|| "none".into())
             );
+            // key hierarchy gates G4/G5: each tenant's K_t fingerprint and the bundle digest (non-secret)
+            let base = s3vault_format::keystore::Baseline::from_bundle(&b.to_text())?;
             for t in b.tenants.tenants.values() {
-                println!("tenant {} {} {}", t.name, t.id_hex(), t.status.as_str());
+                let fp = base.tenants.get(&t.name).map(|x| x.2.as_str()).unwrap_or("-");
+                println!("tenant {} {} {} k_t_fp {fp}", t.name, t.id_hex(), t.status.as_str());
             }
-            println!("ledger entries {}", b.ledger.entries.len());
+            println!("ledger entries {} head {}", b.ledger.entries.len(), base.ledger_head);
+            println!("bundle_sha256 {} root_escrow_digest {}", base.bundle_sha256, base.root_escrow_digest);
             Ok(())
         }
         "rebuild" => {

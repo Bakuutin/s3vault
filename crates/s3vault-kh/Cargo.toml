@@ -1,0 +1,26 @@
+[package]
+name = "s3vault-kh"
+description = "s3vault key hierarchy network tools: keystore mirror push/pull (B2, object lock), direct sample decryption from the store (kh-verify --sample). Runs in its own container; holds only the mirror key or a read-only store key."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s3vault-format.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+rusty-s3 = "0.12"
+jiff = { version = "1", default-features = false, features = ["std"] }
+url = "2"
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.9"
+anyhow = "1"
+sha2.workspace = true
+md-5.workspace = true
+hex.workspace = true
+data-encoding.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+
+[features]
+fault-injection = ["s3vault-format/fault-injection"]

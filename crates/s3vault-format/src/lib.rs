@@ -8,11 +8,14 @@
 //!
 //! This crate has no async runtime and no C dependencies, so it also builds the static key-service binary.
 
+pub mod hpke;
 pub mod keyproto;
 pub mod keyring;
 pub mod keys2;
+pub mod keystore;
 pub mod ledger;
 pub mod object;
+pub mod slots;
 pub mod spool;
 
 #[derive(Debug, thiserror::Error)]
